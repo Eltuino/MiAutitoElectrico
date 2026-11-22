@@ -24,22 +24,30 @@ import {
   Wind,
   Ticket,
   Radio,
+  Check,
+  BookmarkPlus,
+  CloudOff,
+  Download,
 } from 'lucide-react';
 import PlaceInput from '../components/PlaceInput';
 import MapPicker from '../components/MapPicker';
 import TripMap from '../components/TripMap';
 import SocChart from '../components/SocChart';
-import { RangeField, Segmented, Stepper, Toggle, socColor } from '../components/ui';
+import { RangeField, Segmented, Sheet, Stepper, Toggle, socColor } from '../components/ui';
 import { CARGO_KG, CARGO_LABEL, MODE_INFO, useSettings, type Cargo, type TripMode } from '../store/settings';
 import { useTrip } from '../store/trip';
 import { useUi } from '../store/ui';
+import { useSaved, cachePlanFor, cachedPlanFor, type SavedKind, type SavedRoute } from '../store/saved';
 import { useChargers, summarize, shortName, expectedWaitMin, priceStats, type Station } from '../lib/chargers';
 import { billedKwh } from '../lib/car';
-import { planTrip, googleMapsUrl, type TripPlan } from '../lib/planner';
+import { planTrip, googleMapsUrl, type PlanInput, type TripPlan } from '../lib/planner';
 import { getCurrentPosition, reverseGeocode, type Place } from '../lib/places';
 import { loadTolls, groupHits } from '../lib/tolls';
+import { ROUTE_PREFS, optionTitle, type RoutePref } from '../lib/routeChoice';
+import { downloadRoute, isDownloaded, type DownloadProgress } from '../lib/offlineMap';
 import { getWeather } from '../lib/weather';
 import { fmtCLP, fmtDuration, fmtKm, fmtTime } from '../lib/format';
+import { ROUTE_ICON, SAVED_ICON } from '../components/icons';
 
 const MODE_ICON: Record<TripMode, React.ReactNode> = {
   rapido: <Zap size={18} />,
@@ -64,14 +72,28 @@ export default function PlanTrip() {
   const [passengers, setPassengers] = useState(s.passengers);
   const [cargo, setCargo] = useState<Cargo>(s.cargo);
   const [climateOn, setClimateOn] = useState(s.climateOn);
-  const [avoidTolls, setAvoidTolls] = useState(s.avoidTolls);
+  const [routePref, setRoutePref] = useState<RoutePref>(s.routePref ?? 'economica');
   /** hora de salida: undefined = ahora */
   const [departAt, setDepartAt] = useState<number | undefined>(undefined);
   const [temps, setTemps] = useState<{ o?: number; d?: number }>({});
   const [busy, setBusy] = useState(false);
+  /** opción de ruta que se está recalculando desde el resultado */
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  /** ruta guardada que se está calculando */
+  const [quickBusy, setQuickBusy] = useState<string | null>(null);
   const [locating, setLocating] = useState(false);
   const [error, setError] = useState<string>();
   const [picker, setPicker] = useState<'origin' | 'dest' | null>(null);
+  const saved = useSaved((x) => x.routes);
+  const quick = useUi((u) => u.quickRoute);
+
+  // Ruta guardada pedida desde Inicio: calcular y abrir la navegación
+  useEffect(() => {
+    if (!quick) return;
+    useUi.getState().clearQuick();
+    void runSaved(quick, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [quick]);
 
   // Usa la ubicación si el permiso ya fue concedido antes
   useEffect(() => {
@@ -110,9 +132,16 @@ export default function PlanTrip() {
     setSpeed(MODE_INFO[m].speed);
   }
 
-  async function calculate() {
-    if (!origin || !dest) return;
-    setBusy(true);
+  /**
+   * Calcula el viaje. `over` permite partir de otro origen/destino (rutas guardadas) o
+   * rehacer un plan con otra opción de ruta (`base` + `routeKey`).
+   */
+  async function calculate(over: { origin?: Place; dest?: Place; routePref?: RoutePref; base?: PlanInput; routeKey?: string; savedId?: string } = {}): Promise<TripPlan | null> {
+    const o = over.base?.origin ?? over.origin ?? origin;
+    const d = over.base?.destination ?? over.dest ?? dest;
+    if (!o || !d) return null;
+    if (over.routeKey) setBusyKey(over.routeKey);
+    else setBusy(true);
     setError(undefined);
     try {
       let list = stations;
@@ -121,12 +150,22 @@ export default function PlanTrip() {
         list = useChargers.getState().stations;
       } else refreshChargers();
       const tollData = await loadTolls();
-      const tO = temps.o ?? 18;
-      const tD = temps.d ?? tO;
-      const p = await planTrip(
-        {
-          origin,
-          destination: dest,
+      let input: PlanInput;
+      if (over.base) {
+        const b = over.base;
+        input = { ...b, routeKey: over.routeKey, departAt: b.departAt && b.departAt > Date.now() + 60000 ? b.departAt : Date.now() };
+      } else {
+        // temperatura del destino de una ruta guardada (la del formulario puede ser de otro lugar)
+        let tO = temps.o ?? 18;
+        let tD = temps.d ?? tO;
+        if (over.origin || over.dest) {
+          const [wo, wd] = await Promise.all([getWeather(o.lngLat), getWeather(d.lngLat)]);
+          tO = wo?.tempC ?? tO;
+          tD = wd?.tempC ?? tO;
+        }
+        input = {
+          origin: o,
+          destination: d,
           startSoc,
           arrivalMin,
           mode,
@@ -134,37 +173,102 @@ export default function PlanTrip() {
           passengers,
           cargoKg: CARGO_KG[cargo],
           climateOn,
-          avoidTolls,
+          routePref: over.routePref ?? routePref,
           calibration: s.calibration,
           usableKwh: s.usableKwh,
           tempOrigin: tO,
           tempDest: tD,
           priceDc: priceStats(list).dc ?? s.priceDc,
+          priceHome: s.priceHome,
           gasPrice: s.gasPrice,
           gasKmPerL: s.gasKmPerL,
           departAt: departAt ?? Date.now(),
-        },
-        list,
-        undefined,
-        tollData?.tolls ?? [],
-        tollData?.od ?? [],
-      );
+        };
+      }
+      const p = await planTrip(input, list, undefined, tollData?.tolls ?? [], tollData?.od ?? []);
       setPlan(p);
-      addRecent(dest);
-      addRecent(origin);
-      s.set({ mode, passengers, cargo, arrivalMin, climateOn, avoidTolls, soc: startSoc, socUpdatedAt: Date.now() });
+      if (over.savedId) cachePlanFor(over.savedId, p);
+      if (!over.base) {
+        addRecent(d);
+        addRecent(o);
+        s.set({ mode, passengers, cargo, arrivalMin, climateOn, routePref: over.routePref ? s.routePref : routePref, soc: startSoc, socUpdatedAt: Date.now() });
+      }
       setEditing(false);
-      document.querySelector('.screen')?.scrollTo({ top: 0 });
+      if (!over.routeKey) document.querySelector('.screen')?.scrollTo({ top: 0 });
+      return p;
     } catch (e) {
       setError((e as Error).message);
+      if (over.routeKey) showToast((e as Error).message);
+      return null;
     } finally {
       setBusy(false);
+      setBusyKey(null);
     }
   }
 
-  if (plan && !editing) return <TripResult plan={plan} onEdit={() => setEditing(true)} onStart={() => setNavigating(true)} />;
+  /** Ruta guardada: desde donde estés (o su origen) hasta su destino. Sin internet, usa el último cálculo. */
+  async function runSaved(r: SavedRoute, navigate: boolean) {
+    setQuickBusy(r.name);
+    setError(undefined);
+    setDest(r.destination);
+    setRoutePref(r.routePref);
+    const cached = cachedPlanFor(r.id);
+    try {
+      let o = r.origin;
+      if (!o) {
+        try {
+          const p = await getCurrentPosition();
+          o = { name: 'Mi ubicación', detail: 'Ubicación actual', lngLat: p, isMe: true };
+        } catch (e) {
+          if (!cached) throw e;
+          o = cached.plan.input.origin;
+        }
+      }
+      setOrigin(o);
+      useSaved.getState().touch(r.id);
+      const p = await calculate({ origin: o, dest: r.destination, routePref: r.routePref, savedId: r.id });
+      if (p) {
+        if (navigate) setNavigating(true);
+        return;
+      }
+      if (!cached) return; // el error ya quedó en pantalla
+      setError(undefined);
+      setPlan({ ...cached.plan, createdAt: Date.now() });
+      setEditing(false);
+      if (navigate) setNavigating(true);
+      showToast('Sin conexión: uso la última ruta calculada a ' + r.name);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setQuickBusy(null);
+    }
+  }
 
-  const loadTxt = `${MODE_INFO[mode].label} · ${speed} km/h · ${passengers} ${passengers === 1 ? 'persona' : 'personas'}`;
+  if (quickBusy)
+    return (
+      <div className="screen" style={{ display: 'grid', placeItems: 'center' }}>
+        <div className="center">
+          <Loader2 size={40} className="spin" color="var(--primary)" />
+          <div className="bold mt12" style={{ fontSize: 18 }}>
+            Calculando ruta a {quickBusy}…
+          </div>
+          <div className="small muted">Tu ubicación, la ruta, los peajes y la batería</div>
+        </div>
+      </div>
+    );
+
+  if (plan && !editing)
+    return (
+      <TripResult
+        plan={plan}
+        onEdit={() => setEditing(true)}
+        onStart={() => setNavigating(true)}
+        busyKey={busyKey}
+        onPickRoute={(key) => calculate({ base: plan.input, routeKey: key })}
+      />
+    );
+
+  const loadTxt = `${MODE_INFO[mode].label} · ${speed} km/h · ${passengers} ${passengers === 1 ? 'persona' : 'personas'} · ruta ${ROUTE_PREFS[routePref].short.toLowerCase()}`;
 
   return (
     <div className="screen">
@@ -179,6 +283,16 @@ export default function PlanTrip() {
           </button>
         )}
       </div>
+
+      {saved.length > 0 && (
+        <div className="chips" style={{ marginBottom: 12 }}>
+          {saved.map((r) => (
+            <button key={r.id} className="chip" style={{ background: '#fff', boxShadow: 'var(--shadow)', padding: '9px 14px', fontSize: 13.5 }} onClick={() => runSaved(r, false)}>
+              <span style={{ color: 'var(--primary)', display: 'inline-flex' }}>{SAVED_ICON[r.kind]}</span> {r.name}
+            </button>
+          ))}
+        </div>
+      )}
 
       <div className="card" style={{ position: 'relative', zIndex: 5 }}>
         <div className="stack" style={{ paddingRight: 42 }}>
@@ -263,7 +377,7 @@ export default function PlanTrip() {
 
       <div className="card">
         <div className="card-title">
-          <ThermometerSun size={16} /> Clima y ruta
+          <ThermometerSun size={16} /> Clima
         </div>
         <div className="grid2">
           <div className="stat">
@@ -281,9 +395,25 @@ export default function PlanTrip() {
         </div>
         <div className="mt8" />
         <Toggle on={climateOn} onChange={setClimateOn} label={<span className="row" style={{ gap: 6 }}><Snowflake size={16} /> Aire acondicionado / calefacción</span>} sub="Se calcula según la temperatura del camino" />
-        <Toggle on={avoidTolls} onChange={setAvoidTolls} label="Evitar peajes" sub="Puede alargar el viaje" />
+      </div>
+
+      <div className="card">
+        <div className="card-title">
+          <Ticket size={16} /> Ruta, peajes y TAG
+        </div>
+        <div className="opt-grid" role="radiogroup">
+          {(Object.keys(ROUTE_PREFS) as RoutePref[]).map((k) => (
+            <button key={k} className={`opt ${routePref === k ? 'on' : ''}`} role="radio" aria-checked={routePref === k} onClick={() => setRoutePref(k)}>
+              <span className="ic-bubble">{ROUTE_ICON[k]}</span>
+              {ROUTE_PREFS[k].short}
+            </button>
+          ))}
+        </div>
+        <div className="small ink2 mt8" style={{ padding: '0 4px' }}>
+          {ROUTE_PREFS[routePref].sub} Siempre verás las otras rutas con su precio para elegir.
+        </div>
         <div className="label mt12">
-          <Clock size={13} /> ¿Cuándo sales? (cambia las tarifas punta y del TAG)
+          <Clock size={13} /> ¿Cuándo sales? (cambia peajes punta, TAG, calles reversibles y vías exclusivas)
         </div>
         <Segmented
           value={departAt === undefined ? 'now' : 'later'}
@@ -312,7 +442,7 @@ export default function PlanTrip() {
       )}
 
       <div className="mt16" />
-      <button className="btn primary block" style={{ height: 60, fontSize: 16.5 }} disabled={!origin || !dest || busy} onClick={calculate}>
+      <button className="btn primary block" style={{ height: 60, fontSize: 16.5 }} disabled={!origin || !dest || busy} onClick={() => calculate()}>
         {busy ? (
           <>
             <Loader2 className="spin" size={20} /> Calculando ruta y cargas…
@@ -343,8 +473,21 @@ export default function PlanTrip() {
 
 // ---------------------------------------------------------------------------
 
-function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => void; onStart: () => void }) {
+function TripResult({
+  plan,
+  onEdit,
+  onStart,
+  busyKey,
+  onPickRoute,
+}: {
+  plan: TripPlan;
+  onEdit: () => void;
+  onStart: () => void;
+  busyKey: string | null;
+  onPickRoute: (key: string) => void;
+}) {
   const { showStation, showToast } = useUi();
+  const [saveOpen, setSaveOpen] = useState(false);
   const stations = useChargers((c) => c.stations);
   const t = plan.totals;
   const departAt = plan.input.departAt && plan.input.departAt > Date.now() + 5 * 60000 ? plan.input.departAt : undefined;
@@ -355,7 +498,12 @@ function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => v
   const live = useMemo(() => new Map(stations.map((s) => [s.id, s])), [stations]);
   const fallbackPrice = useMemo(() => priceStats(stations).dc ?? plan.input.priceDc, [stations, plan]);
   const liveCost = plan.stops.reduce((a, s) => a + stopCost(s, live.get(s.station.id) ?? s.station, fallbackPrice, plan.input.usableKwh).cost, 0);
-  const saved = t.gasCostClp - liveCost;
+  // la energía que no se carga en el camino salió de la batería cargada en casa
+  const priceHome = plan.input.priceHome ?? useSettings.getState().priceHome;
+  const homeKwh = Math.max(0, t.energyKwh - plan.stops.reduce((a, s) => a + (s.kwh ?? 0), 0));
+  const homeCost = homeKwh * priceHome;
+  const energyCost = liveCost + homeCost;
+  const saved = t.gasCostClp - energyCost;
 
   const share = async () => {
     const lines = [
@@ -363,7 +511,7 @@ function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => v
       `${fmtKm(t.distanceM)} · ${fmtDuration(t.totalMin)} · llegada aprox. ${fmtTime(arriveAt)}`,
       ...plan.stops.map((s, i) => `${i + 1}. ${s.station.name}: ${Math.round(s.arriveSoc)}% → ${s.departSoc}% (${fmtDuration(s.chargeMin)})`),
       `Llegada con ${Math.round(t.arriveSoc)}% de batería`,
-      plan.tolls ? `Carga ≈ ${fmtCLP(liveCost)} · Peajes y TAG ≈ ${fmtCLP(tollClp)}` : '',
+      plan.tolls ? `Energía ≈ ${fmtCLP(energyCost)} · Peajes y TAG ≈ ${fmtCLP(tollClp)}` : '',
       googleMapsUrl(plan),
     ];
     const text = lines.filter(Boolean).join('\n');
@@ -387,6 +535,9 @@ function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => v
           </div>
           <h1>Tu viaje</h1>
         </div>
+        <button className="icon-btn" onClick={() => setSaveOpen(true)} aria-label="Guardar ruta">
+          <BookmarkPlus size={18} />
+        </button>
         <button className="icon-btn" onClick={share} aria-label="Compartir">
           <Share2 size={18} />
         </button>
@@ -417,13 +568,15 @@ function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => v
         </div>
       </div>
 
+      <RouteChoices plan={plan} busyKey={busyKey} onPick={onPickRoute} />
+
       <div className="grid3 mt12">
         <Stat icon={<Navigation size={13} />} k="Manejo" v={fmtDuration(t.driveMin)} />
         <Stat icon={<BatteryCharging size={13} />} k="Cargando" v={fmtDuration(t.chargeMin)} />
         <Stat icon={<Flag size={13} />} k="Llegas con" v={`${Math.round(t.arriveSoc)}%`} color={socColor(t.arriveSoc)} />
         <Stat icon={<Zap size={13} />} k="Energía" v={`${Math.round(t.energyKwh)}`} unit="kWh" />
         <Stat icon={<Ticket size={13} />} k="Peajes y TAG" v={plan.tolls ? fmtCLP(tollClp) : '—'} />
-        <Stat icon={<PiggyBank size={13} />} k="Costo carga" v={fmtCLP(liveCost)} />
+        <Stat icon={<PiggyBank size={13} />} k="Costo energía" v={fmtCLP(energyCost)} />
       </div>
 
       {plan.tolls && (
@@ -431,18 +584,25 @@ function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => v
           <div className="row between">
             <div>
               <div className="small muted bold">Costo total del viaje</div>
-              <div style={{ fontSize: 28, fontWeight: 800, letterSpacing: '-0.02em' }}>{fmtCLP(liveCost + tollClp)}</div>
+              <div style={{ fontSize: 28, fontWeight: 800, letterSpacing: '-0.02em' }}>{fmtCLP(energyCost + tollClp)}</div>
             </div>
             <div className="small ink2" style={{ textAlign: 'right' }}>
               <div>
-                Carga <b>{fmtCLP(liveCost)}</b>
+                Luz de casa <b>{fmtCLP(homeCost)}</b>
               </div>
+              {plan.stops.length > 0 && (
+                <div>
+                  Carga en ruta <b>{fmtCLP(liveCost)}</b>
+                </div>
+              )}
               <div>
                 Peajes y TAG <b>{fmtCLP(tollClp)}</b>
               </div>
             </div>
           </div>
-          <div className="tiny muted mt8">En auto a bencina serían ≈ {fmtCLP(t.gasCostClp + tollClp)} (mismos peajes).</div>
+          <div className="tiny muted mt8">
+            “Luz de casa”: los {Math.round(homeKwh)} kWh que salen de la batería que cargaste en casa ({fmtCLP(priceHome)}/kWh). En auto a bencina serían ≈ {fmtCLP(t.gasCostClp + tollClp)} (mismos peajes).
+          </div>
         </div>
       )}
 
@@ -456,6 +616,16 @@ function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => v
             <div className="small ink2">
               y evitas {Math.round(t.co2SavedKg)} kg de CO₂ <Wind size={12} />
             </div>
+          </div>
+        </div>
+      )}
+
+      {(plan.route.timed?.avoided.length ?? 0) > 0 && (
+        <div className="card mt12 row" style={{ background: 'var(--primary-soft)', boxShadow: 'none', border: 0, alignItems: 'flex-start' }}>
+          <Clock size={18} color="var(--primary)" style={{ flex: 'none', marginTop: 2 }} />
+          <div className="small" style={{ color: 'var(--primary-ink)', fontWeight: 600 }}>
+            A la hora en que pasas, {plan.route.timed!.avoided.join(', ')} {plan.route.timed!.avoided.length === 1 ? 'va' : 'van'} en otro sentido (calle reversible): la ruta
+            {plan.route.timed!.avoided.length === 1 ? ' la' : ' las'} evita en ese sentido.
           </div>
         </div>
       )}
@@ -529,7 +699,12 @@ function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => v
         </div>
       </div>
 
+      <OfflineCard key={plan.id} plan={plan} />
+
       <div className="stack mt16">
+        <button className="btn soft block" onClick={() => setSaveOpen(true)}>
+          <BookmarkPlus size={19} /> Guardar como ruta frecuente
+        </button>
         <button className="btn primary block" style={{ height: 60, fontSize: 16.5 }} onClick={onStart} disabled={!plan.feasible && plan.stops.length === 0 && t.arriveSoc < 0}>
           <Navigation size={20} /> Iniciar viaje
         </button>
@@ -541,7 +716,181 @@ function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => v
       <div className="tiny muted center mt12" style={{ padding: '0 12px' }}>
         Estimaciones basadas en la ficha del Ora 5, la ruta, las pendientes y el clima. Puedes ajustar el consumo real en Ajustes.
       </div>
+
+      <SaveRouteSheet key={`save-${plan.id}`} plan={plan} open={saveOpen} onClose={() => setSaveOpen(false)} />
     </div>
+  );
+}
+
+/** Rutas posibles con su tiempo y costo, para elegir */
+function RouteChoices({ plan, busyKey, onPick }: { plan: TripPlan; busyKey: string | null; onPick: (key: string) => void }) {
+  const opts = plan.routeOptions ?? [];
+  if (opts.length < 2) return null;
+  const sel = opts.find((o) => o.key === plan.routeKey) ?? opts[0];
+  const cost = (o: (typeof opts)[number]) => o.tollClp + o.energyClp;
+  return (
+    <div className="card mt12">
+      <div className="card-title">
+        <RouteIcon size={16} /> Rutas posibles
+      </div>
+      {opts.map((o) => {
+        const on = o.key === sel.key;
+        const dMin = Math.round((o.timeS - sel.timeS) / 60);
+        const dClp = Math.round((cost(o) - cost(sel)) / 10) * 10;
+        return (
+          <button key={o.key} className={`route-opt ${on ? 'on' : ''}`} disabled={!!busyKey} onClick={() => !on && onPick(o.key)} aria-pressed={on}>
+            <span className="radio">{busyKey === o.key ? <Loader2 size={14} className="spin" color="var(--primary)" /> : on ? <Check size={14} strokeWidth={3} /> : null}</span>
+            <div className="grow" style={{ minWidth: 0 }}>
+              <div className="bold">{optionTitle(o)}</div>
+              <div className="tiny muted">
+                {fmtKm(o.distanceM)} · {o.tollClp > 0 ? `peajes ${fmtCLP(o.tollClp)}${o.tagCount === 0 ? ' (sin TAG)' : ''}` : 'sin peajes ni TAG'} · energía {fmtCLP(o.energyClp)}
+              </div>
+            </div>
+            <div style={{ textAlign: 'right', flex: 'none' }}>
+              <div className="bold">{fmtDuration(o.timeS / 60)}</div>
+              <div className="tiny bold" style={{ color: 'var(--ink-2)' }}>
+                {fmtCLP(cost(o))}
+              </div>
+              {!on && (dMin !== 0 || dClp !== 0) && (
+                <div className="tiny bold" style={{ color: dClp < 0 ? '#0a7a47' : 'var(--ink-3)' }}>
+                  {dMin > 0 ? `+${dMin} min` : dMin < 0 ? `${dMin} min` : 'mismo tiempo'}
+                  {dClp < 0 ? ` · ahorras ${fmtCLP(-dClp)}` : dClp > 0 ? ` · +${fmtCLP(dClp)}` : ''}
+                </div>
+              )}
+            </div>
+          </button>
+        );
+      })}
+      <div className="tiny muted mt8">
+        Costo = peajes y TAG a la hora en que pasarías + la energía que gasta tu Ora 5 en esa ruta. Respetan las calles reversibles, vías exclusivas y cierres según la hora; los tiempos no incluyen el tráfico en vivo.
+      </div>
+    </div>
+  );
+}
+
+/** Descarga el mapa de la ruta para verlo sin internet (túneles, zonas sin señal) */
+function OfflineCard({ plan }: { plan: TripPlan }) {
+  const [state, setState] = useState<'idle' | 'busy' | 'done' | 'error'>(() => (isDownloaded(plan.id) ? 'done' : 'idle'));
+  const [prog, setProg] = useState<DownloadProgress | null>(null);
+  const start = async () => {
+    setState('busy');
+    try {
+      const res = await downloadRoute(plan.id, plan.route.coords, setProg);
+      setProg(res);
+      setState(res.failed > res.total * 0.05 ? 'error' : 'done');
+    } catch {
+      setState('error');
+    }
+  };
+  const pct = prog ? Math.round((prog.done / Math.max(1, prog.total)) * 100) : 0;
+  return (
+    <div className="card">
+      <div className="card-title">
+        <CloudOff size={16} /> Sin señal ni internet
+      </div>
+      <div className="small ink2">
+        La ruta, las indicaciones y los avisos ya quedan guardados en el teléfono. Descarga también el mapa para verlo en túneles y zonas sin internet.
+      </div>
+      {state === 'busy' && (
+        <>
+          <div className="progress mt12">
+            <div style={{ width: `${pct}%` }} />
+          </div>
+          <div className="tiny muted mt8">
+            Descargando mapa… {pct}% {prog && prog.bytes > 0 ? `· ${(prog.bytes / 1e6).toFixed(1)} MB` : ''}
+          </div>
+        </>
+      )}
+      {state === 'done' && (
+        <div className="row mt12 small bold" style={{ color: '#0a7a47', gap: 6 }}>
+          <Check size={16} /> Mapa de la ruta guardado{prog && prog.bytes > 0 ? ` (${(prog.bytes / 1e6).toFixed(1)} MB)` : ''}
+        </div>
+      )}
+      {(state === 'idle' || state === 'error') && (
+        <button className="btn soft block mt12" onClick={start}>
+          <Download size={18} /> {state === 'error' ? 'Reintentar descarga del mapa' : 'Descargar mapa de la ruta'}
+        </button>
+      )}
+      {state === 'error' && <div className="tiny mt8" style={{ color: 'var(--bad)' }}>No se pudo descargar todo. Revisa tu conexión e intenta de nuevo.</div>}
+    </div>
+  );
+}
+
+const KIND_NAME: Record<SavedKind, string> = { casa: 'Casa', trabajo: 'Trabajo', otro: '' };
+
+/** Guarda el destino (y el tipo de ruta) como ruta frecuente: Casa, Trabajo… */
+function SaveRouteSheet({ plan, open, onClose }: { plan: TripPlan; open: boolean; onClose: () => void }) {
+  const { showToast } = useUi();
+  const routes = useSaved((x) => x.routes);
+  const existing = routes.find((r) => r.destination.lngLat[0] === plan.input.destination.lngLat[0] && r.destination.lngLat[1] === plan.input.destination.lngLat[1]);
+  const [kind, setKind] = useState<SavedKind>(existing?.kind ?? (routes.some((r) => r.kind === 'trabajo') ? (routes.some((r) => r.kind === 'casa') ? 'otro' : 'casa') : 'trabajo'));
+  const [name, setName] = useState(existing?.name ?? KIND_NAME[kind] ?? '');
+  const [fromHere, setFromHere] = useState(existing ? !existing.origin : plan.input.origin.isMe ?? true);
+  // la preferencia de la opción elegida (si eligió "Más económica" en el resultado, se guarda así)
+  const chosen = plan.routeOptions?.find((o) => o.key === plan.routeKey);
+  const pref: RoutePref = (chosen?.badges.includes(plan.input.routePref ?? 'economica') ? plan.input.routePref : chosen?.badges[0]) ?? plan.input.routePref ?? 'economica';
+
+  const save = () => {
+    const r = useSaved.getState().save({
+      id: existing?.id,
+      name: name.trim() || plan.input.destination.name,
+      kind,
+      destination: plan.input.destination,
+      origin: fromHere
+        ? undefined
+        : { ...plan.input.origin, isMe: false, name: plan.input.origin.isMe ? plan.input.origin.detail || 'Punto de partida' : plan.input.origin.name },
+      routePref: pref,
+    });
+    cachePlanFor(r.id, plan);
+    onClose();
+    showToast(`Guardada "${r.name}". Está en Inicio para salir con un toque.`);
+    // el mapa del camino, para cuando no haya señal
+    if (!isDownloaded(plan.id) && plan.totals.distanceM < 300000) downloadRoute(plan.id, plan.route.coords).catch(() => {});
+  };
+
+  return (
+    <Sheet open={open} onClose={onClose}>
+      <h3 style={{ fontSize: 19, fontWeight: 800 }}>{existing ? 'Actualizar ruta frecuente' : 'Guardar ruta frecuente'}</h3>
+      <div className="small muted">
+        Hacia <b>{plan.input.destination.name}</b>. Desde Inicio la abres con un toque.
+      </div>
+      <div className="grid3 mt16">
+        {(['casa', 'trabajo', 'otro'] as SavedKind[]).map((k) => (
+          <button
+            key={k}
+            className={`opt ${kind === k ? 'on' : ''}`}
+            style={{ flexDirection: 'column', gap: 6, padding: '12px 6px' }}
+            onClick={() => {
+              setKind(k);
+              if (!name || Object.values(KIND_NAME).includes(name)) setName(KIND_NAME[k]);
+            }}
+          >
+            <span className="ic-bubble">{SAVED_ICON[k]}</span>
+            {k === 'casa' ? 'Casa' : k === 'trabajo' ? 'Trabajo' : 'Otra'}
+          </button>
+        ))}
+      </div>
+      <div className="label mt12">Nombre</div>
+      <div className="field">
+        <Pencil size={16} color="var(--ink-3)" />
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Ej: Donde la abuela" maxLength={28} />
+      </div>
+      <div className="label mt12">¿Desde dónde sales?</div>
+      <Segmented
+        value={fromHere ? 'here' : 'fixed'}
+        onChange={(v) => setFromHere(v === 'here')}
+        options={[
+          { value: 'here', label: 'Donde esté', sub: 'tu ubicación' },
+          { value: 'fixed', label: 'Siempre desde', sub: plan.input.origin.isMe ? 'este punto' : plan.input.origin.name },
+        ]}
+      />
+      <div className="small ink2 mt12" style={{ padding: '0 4px' }}>
+        Ruta: <b>{ROUTE_PREFS[pref].label.toLowerCase()}</b>. Guardo también este cálculo y el mapa, por si sales sin internet.
+      </div>
+      <button className="btn primary block mt16" onClick={save}>
+        <BookmarkPlus size={18} /> Guardar
+      </button>
+    </Sheet>
   );
 }
 

@@ -2,6 +2,17 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 
+/**
+ * Plugin de Workbox para el mapa (se copia como texto al service worker: no puede usar variables de afuera).
+ * - La llave del caché no lleva la versión semanal de OpenFreeMap.
+ * - Si no está en el caché normal, se busca en los mapas descargados ("map-offline").
+ */
+const offlineMapPlugin = {
+  cacheKeyWillBeUsed: async ({ request }: { request: Request }) => request.url.replace(/\/planet\/[^/]+\/(\d+\/\d+\/\d+\.pbf)/, '/planet/$1'),
+  cachedResponseWillBeUsed: async ({ request, cachedResponse }: { request: Request; cachedResponse?: Response }) =>
+    cachedResponse || (await caches.match(request.url, { cacheName: 'map-offline', ignoreVary: true })) || null,
+};
+
 // BASE_PATH permite publicar en una subcarpeta (ej. GitHub Pages: /MiAutitoElectrico/)
 export default defineConfig({
   base: process.env.BASE_PATH || '/',
@@ -32,12 +43,32 @@ export default defineConfig({
         maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
         runtimeCaching: [
           {
-            // Tiles y estilos del mapa: se guardan para ver el mapa con mala señal
-            urlPattern: /^https:\/\/tiles\.openfreemap\.org\/.*/,
+            // Tiles vectoriales: se guardan sin la versión semanal en la URL; si no están en el caché
+            // de navegación se buscan en los mapas descargados (src/lib/offlineMap.ts)
+            urlPattern: /^https:\/\/tiles\.openfreemap\.org\/planet\/[^/]+\/\d+\/\d+\/\d+\.pbf/,
             handler: 'CacheFirst',
             options: {
               cacheName: 'map-tiles',
-              expiration: { maxEntries: 3000, maxAgeSeconds: 60 * 60 * 24 * 30 },
+              expiration: { maxEntries: 4000, maxAgeSeconds: 60 * 60 * 24 * 60 },
+              matchOptions: { ignoreVary: true },
+              plugins: [offlineMapPlugin],
+            },
+          },
+          {
+            // Estilo, TileJSON e íconos: rápido desde el caché y se actualiza por detrás
+            urlPattern: /^https:\/\/tiles\.openfreemap\.org\/(styles\/|sprites\/|planet(\?.*)?$)/,
+            handler: 'StaleWhileRevalidate',
+            options: { cacheName: 'map-style', matchOptions: { ignoreVary: true }, plugins: [offlineMapPlugin] },
+          },
+          {
+            // Fuentes y relieve de fondo (no cambian)
+            urlPattern: /^https:\/\/tiles\.openfreemap\.org\/(fonts|natural_earth)\//,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'map-static',
+              expiration: { maxEntries: 600, maxAgeSeconds: 60 * 60 * 24 * 180 },
+              matchOptions: { ignoreVary: true },
+              plugins: [offlineMapPlugin],
             },
           },
         ],

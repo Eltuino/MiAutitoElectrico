@@ -1,4 +1,5 @@
-import { cumulativeDistances, decodePolyline6, type LngLat } from './geo';
+import { cumulativeDistances, decodePolyline6, haversine, type LngLat } from './geo';
+import { loadTimedStreets, streetNames, timeAlong, wrongWays, type DirectedPoint } from './timedStreets';
 
 const VALHALLA = 'https://valhalla1.openstreetmap.de/route';
 const ELEV_INTERVAL = 200; // m
@@ -40,35 +41,134 @@ export interface Route {
   timeS: number;
   hasToll: boolean;
   hasHighway: boolean;
+  /** calles con sentido según la hora: las que se evitaron y las que no se pudo evitar */
+  timed?: { avoided: string[]; wrong: string[] };
 }
 
 export interface RouteOptions {
   /** velocidad máxima de crucero (km/h) */
   topSpeed?: number;
+  /** no usar ningún camino con peaje (plazas ni TAG) */
+  excludeTolls?: boolean;
+  /** @deprecated planes guardados con la opción antigua: equivale a excludeTolls */
   avoidTolls?: boolean;
+  /** puntos (pórticos TAG) por cuya calzada no se debe pasar */
+  excludePoints?: LngLat[];
+  /** rutas alternativas adicionales (solo con 2 puntos) */
+  alternates?: number;
+  /**
+   * Hora de salida (ms). Con ella se respetan las reglas según la hora: vías exclusivas, calles
+   * cerradas los domingos y ferias (las aplica Valhalla) y calles reversibles (las revisa la app).
+   */
+  departAt?: number;
+  /** minutos detenido al final de cada tramo (cargas), para estimar la hora de paso */
+  legDelayMin?: number[];
+}
+
+/** Límites del servidor público de Valhalla */
+const MAX_EXCLUDE_LOCATIONS = 50;
+const MAX_EXCLUDE_TRIANGLES = 24; // 100 vértices (cada triángulo cuenta 4 al cerrarse)
+export const MAX_EXCLUDE_POINTS = MAX_EXCLUDE_LOCATIONS + MAX_EXCLUDE_TRIANGLES;
+/** tramos de calles reversibles que se pueden excluir en un solo sentido por consulta */
+const MAX_DIRECTED = 40;
+
+/** "2026-11-23T08:00" en hora local */
+function localIso(ms: number) {
+  const d = new Date(ms);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 /** Tipos de maniobra de Valhalla que significan llegada */
 export const ARRIVE_TYPES = new Set([4, 5, 6]);
 
 export async function getRoute(points: LngLat[], opts: RouteOptions = {}, signal?: AbortSignal): Promise<Route> {
-  const body = {
-    locations: points.map((p, i) => ({
+  return (await getRoutes(points, opts, signal))[0];
+}
+
+/**
+ * Ruta principal + alternativas (si se piden).
+ * Con `departAt`, si la ruta va contra el sentido de una calle reversible a la hora de paso, se pide de
+ * nuevo excluyendo esos tramos solo en ese sentido (hasta 3 veces). Las alternativas en contra se descartan.
+ */
+export async function getRoutes(points: LngLat[], opts: RouteOptions = {}, signal?: AbortSignal): Promise<Route[]> {
+  const idx = opts.departAt !== undefined ? await loadTimedStreets() : null;
+  const directed: DirectedPoint[] = [];
+  const avoided = new Set<string>();
+  let last: Route[] | null = null;
+  let lastWrong: string[] = [];
+  for (let round = 0; round < 4; round++) {
+    let routes: Route[];
+    try {
+      routes = await requestRoutes(points, opts, directed, signal);
+    } catch (e) {
+      // si excluir los tramos deja sin camino, quedarse con la ruta anterior (avisando)
+      if (last && (e as Error).name !== 'AbortError') break;
+      throw e;
+    }
+    if (!idx || opts.departAt === undefined) return routes;
+    const check = (r: Route) => {
+      // cerca del inicio o del final de cada tramo no se excluye (podrías estar estacionado ahí)
+      const ends = [0, ...r.legEnds.map((i) => r.cum[i])];
+      return wrongWays(r, idx, timeAlong(r, opts.departAt!, opts.legDelayMin)).filter((w) => ends.every((e) => Math.abs(w.alongM - e) > 150));
+    };
+    const bad = check(routes[0]);
+    last = [routes[0], ...routes.slice(1).filter((r) => !check(r).length)];
+    lastWrong = streetNames(bad);
+    if (!bad.length || directed.length >= MAX_DIRECTED) break;
+    for (const b of bad) {
+      if (b.way.name) avoided.add(b.way.name);
+      if (directed.length < MAX_DIRECTED && !directed.some((d) => haversine(d.p, b.p) < 25 && Math.abs(d.heading - b.heading) < 30)) directed.push({ p: b.p, heading: b.heading });
+    }
+  }
+  const [main, ...alts] = last!;
+  const okAvoided = [...avoided].filter((n) => !lastWrong.includes(n));
+  main.timed = { avoided: okAvoided, wrong: lastWrong };
+  // las alternativas se calcularon con las mismas exclusiones; las que iban en contra ya se descartaron
+  for (const a of alts) a.timed = { avoided: okAvoided, wrong: [] };
+  return last!;
+}
+
+async function requestRoutes(points: LngLat[], opts: RouteOptions, directed: DirectedPoint[], signal?: AbortSignal): Promise<Route[]> {
+  const body: Record<string, unknown> = {
+    locations: points.map((p) => ({
       lat: +p[1].toFixed(6),
       lon: +p[0].toFixed(6),
-      type: i === 0 || i === points.length - 1 ? 'break' : 'break',
+      type: 'break',
     })),
     costing: 'auto',
     costing_options: {
       auto: {
         top_speed: Math.round(opts.topSpeed ?? 120),
-        use_tolls: opts.avoidTolls ? 0 : 0.5,
+        ...(opts.excludeTolls || opts.avoidTolls ? { exclude_tolls: true } : {}),
       },
     },
     language: 'es-ES',
     units: 'kilometers',
     elevation_interval: ELEV_INTERVAL,
   };
+  if (opts.alternates && points.length === 2) body.alternates = opts.alternates;
+  // hora fija (tipo 3): respeta las restricciones según la hora y, a diferencia del tipo 1, permite alternativas
+  if (opts.departAt !== undefined) body.date_time = { type: 3, value: localIso(opts.departAt) };
+  // tramos de calles reversibles en contra: se excluyen solo en ese sentido (rumbo)
+  const dirLocs = directed.slice(0, MAX_DIRECTED).map((d) => ({ lat: +d.p[1].toFixed(6), lon: +d.p[0].toFixed(6), heading: d.heading, heading_tolerance: 35 }));
+  const freeLocs = MAX_EXCLUDE_LOCATIONS - dirLocs.length;
+  const ex = (opts.excludePoints ?? []).slice(0, freeLocs + MAX_EXCLUDE_TRIANGLES);
+  if (ex.length || dirLocs.length) {
+    // pórticos: primero como "ubicaciones a evitar" (excluye la calzada más cercana)…
+    body.exclude_locations = [...dirLocs, ...ex.slice(0, freeLocs).map((p) => ({ lat: +p[1].toFixed(6), lon: +p[0].toFixed(6) }))];
+    // …y el resto como triángulos de ~4 m sobre el pórtico
+    const tri = ex.slice(freeLocs).map(([x, y]) => {
+      const d = 4 / 111320;
+      const e = d / Math.cos((y * Math.PI) / 180);
+      return [
+        [+(x - e).toFixed(6), +(y - d).toFixed(6)],
+        [+(x + e).toFixed(6), +(y - d).toFixed(6)],
+        [+x.toFixed(6), +(y + d).toFixed(6)],
+      ];
+    });
+    if (tri.length) body.exclude_polygons = tri;
+  }
   const url = `${VALHALLA}?json=${encodeURIComponent(JSON.stringify(body))}`;
   let res: Response;
   try {
@@ -83,7 +183,12 @@ export async function getRoute(points: LngLat[], opts: RouteOptions = {}, signal
     if (/No path could be found|No suitable edges/i.test(msg)) throw new Error('No encontré un camino en auto entre esos puntos.');
     throw new Error('El servicio de rutas no respondió. Intenta de nuevo en unos segundos.');
   }
+  const trips = [json.trip, ...((json.alternates ?? []) as { trip: unknown }[]).map((a) => a.trip)].filter(Boolean);
+  return trips.map(parseTrip);
+}
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function parseTrip(trip: any): Route {
   const coords: LngLat[] = [];
   const legEnds: number[] = [];
   const maneuvers: Maneuver[] = [];
@@ -91,7 +196,7 @@ export async function getRoute(points: LngLat[], opts: RouteOptions = {}, signal
   const elevSamples: { along: number; h: number }[] = [];
   let legOffsetDist = 0;
 
-  json.trip.legs.forEach((leg: any, li: number) => {
+  trip.legs.forEach((leg: any, li: number) => {
     const shape = decodePolyline6(leg.shape);
     const base = coords.length === 0 ? 0 : coords.length - 1;
     // evitar duplicar el vértice de unión entre tramos
@@ -137,7 +242,7 @@ export async function getRoute(points: LngLat[], opts: RouteOptions = {}, signal
   const cumT = new Array<number>(coords.length);
   cumT[0] = 0;
   for (let k = 1; k < coords.length; k++) cumT[k] = cumT[k - 1] + (cum[k] - cum[k - 1]) / (speed[k - 1] / 3.6);
-  const totalT = json.trip.summary.time as number;
+  const totalT = trip.summary.time as number;
   const scaleT = cumT[cumT.length - 1] > 0 ? totalT / cumT[cumT.length - 1] : 1;
   for (let k = 0; k < cumT.length; k++) cumT[k] *= scaleT;
 
@@ -169,8 +274,8 @@ export async function getRoute(points: LngLat[], opts: RouteOptions = {}, signal
     legEnds,
     distanceM: totalDist,
     timeS: totalT,
-    hasToll: !!json.trip.summary.has_toll,
-    hasHighway: !!json.trip.summary.has_highway,
+    hasToll: !!trip.summary.has_toll,
+    hasHighway: !!trip.summary.has_highway,
   };
 }
 

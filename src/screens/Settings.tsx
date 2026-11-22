@@ -1,8 +1,13 @@
-import { useMemo, useState } from 'react';
-import { Car, Info, Volume2, Wallet, Gauge, Smartphone, Database, Play } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { Car, Info, Volume2, Wallet, Gauge, Smartphone, Database, Play, Bookmark, Trash2, CloudOff, Download, Loader2 } from 'lucide-react';
 import { RangeField, Toggle, Segmented } from '../components/ui';
 import { ORA5 } from '../lib/car';
 import { useSettings } from '../store/settings';
+import { useSaved } from '../store/saved';
+import { useUi } from '../store/ui';
+import { SAVED_ICON } from '../components/icons';
+import { ROUTE_PREFS, type RoutePref } from '../lib/routeChoice';
+import { clearOffline, downloadTiles, offlineUsage, tilesInBox, SANTIAGO_BOX, type DownloadProgress } from '../lib/offlineMap';
 import { speak, unlockSpeech } from '../lib/voice';
 import { fmtCLP } from '../lib/format';
 import { useChargers, priceStats } from '../lib/chargers';
@@ -124,6 +129,9 @@ export default function Settings() {
         <RangeField label="Rendimiento auto a bencina equivalente" value={s.gasKmPerL} min={7} max={20} step={0.5} unit="km/L" onChange={(v) => s.set({ gasKmPerL: v })} />
       </div>
 
+      <SavedRoutesCard />
+      <OfflineMapsCard />
+
       <div className="card">
         <div className="card-title">
           <Smartphone size={16} /> Usar durante el viaje
@@ -168,6 +176,112 @@ export default function Settings() {
 }
 
 const dec = (n: number) => n.toLocaleString('es-CL');
+
+function SavedRoutesCard() {
+  const { routes, remove, save } = useSaved();
+  return (
+    <div className="card">
+      <div className="card-title">
+        <Bookmark size={16} /> Rutas frecuentes
+      </div>
+      {routes.length === 0 && <div className="small muted">Aún no guardas rutas. Calcula un viaje y toca “Guardar como ruta frecuente”.</div>}
+      {routes.map((r) => (
+        <div key={r.id} className="list-item" style={{ alignItems: 'center' }}>
+          <span className="ic-bubble" style={{ width: 38, height: 38 }}>
+            {SAVED_ICON[r.kind]}
+          </span>
+          <div className="grow" style={{ minWidth: 0 }}>
+            <div className="bold ellipsis">{r.name}</div>
+            <div className="tiny muted ellipsis">
+              {r.origin ? `${r.origin.name} → ` : 'Desde donde estés → '}
+              {r.destination.name}
+            </div>
+            <select
+              value={r.routePref}
+              onChange={(e) => save({ ...r, routePref: e.target.value as RoutePref })}
+              style={{ marginTop: 4, border: 0, background: 'var(--surface-2)', borderRadius: 10, padding: '4px 8px', fontWeight: 700, color: 'var(--primary)', fontSize: 12.5 }}
+              aria-label="Tipo de ruta"
+            >
+              {(Object.keys(ROUTE_PREFS) as RoutePref[]).map((k) => (
+                <option key={k} value={k}>
+                  {ROUTE_PREFS[k].label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <button className="icon-btn" style={{ color: 'var(--bad)' }} onClick={() => confirm(`¿Borrar la ruta "${r.name}"?`) && remove(r.id)} aria-label={`Borrar ${r.name}`}>
+            <Trash2 size={18} />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function OfflineMapsCard() {
+  const { showToast } = useUi();
+  const [usage, setUsage] = useState<{ files: number; usageMb?: number } | null>(null);
+  const [prog, setProg] = useState<DownloadProgress | null>(null);
+  const [busy, setBusy] = useState(false);
+  const refresh = () => offlineUsage().then(setUsage);
+  useEffect(() => {
+    refresh();
+  }, []);
+  const santiago = async () => {
+    setBusy(true);
+    try {
+      const res = await downloadTiles(tilesInBox(...SANTIAGO_BOX, 5, 14), setProg);
+      showToast(res.failed ? `Mapa de Santiago guardado (faltaron ${res.failed} partes, reintenta luego)` : 'Mapa de Santiago guardado para usar sin internet');
+    } catch (e) {
+      showToast((e as Error).message || 'No se pudo descargar');
+    } finally {
+      setBusy(false);
+      setProg(null);
+      refresh();
+    }
+  };
+  const pct = prog ? Math.round((prog.done / Math.max(1, prog.total)) * 100) : 0;
+  return (
+    <div className="card">
+      <div className="card-title">
+        <CloudOff size={16} /> Mapas sin conexión
+      </div>
+      <div className="small ink2">
+        Cada viaje que inicias guarda el mapa de su camino (y las rutas frecuentes también). Así lo ves en túneles y zonas sin internet. La ruta y las indicaciones siempre quedan guardadas.
+      </div>
+      <div className="small bold mt8">
+        {usage ? `${usage.files.toLocaleString('es-CL')} partes de mapa guardadas${usage.usageMb !== undefined ? ` · la app usa ${Math.round(usage.usageMb)} MB` : ''}` : '…'}
+      </div>
+      {busy ? (
+        <>
+          <div className="progress mt12">
+            <div style={{ width: `${pct}%` }} />
+          </div>
+          <div className="tiny muted mt8">
+            <Loader2 size={12} className="spin" /> Descargando… {pct}% {prog && prog.bytes > 0 ? `· ${(prog.bytes / 1e6).toFixed(0)} MB` : ''}
+          </div>
+        </>
+      ) : (
+        <div className="grid2 mt12">
+          <button className="btn soft" onClick={santiago}>
+            <Download size={17} /> Todo Santiago
+          </button>
+          <button
+            className="btn ghost"
+            onClick={async () => {
+              if (!confirm('¿Borrar los mapas descargados? Se vuelven a bajar cuando los uses con internet.')) return;
+              await clearOffline();
+              refresh();
+            }}
+          >
+            <Trash2 size={17} /> Borrar
+          </button>
+        </div>
+      )}
+      <div className="tiny muted mt8">“Todo Santiago” pesa cerca de 45 MB: mejor con Wi-Fi.</div>
+    </div>
+  );
+}
 
 function Spec({ k, v }: { k: string; v: string }) {
   return (

@@ -6,6 +6,7 @@ import { getRoute, type Route } from './routing';
 import type { Place } from './places';
 import { MODE_INFO, type TripMode } from '../store/settings';
 import { tollsOnRoute, type OdSystem, type TollHit, type TollPoint } from './tolls';
+import { chooseOption, optionInfo, routeOptions, type RouteOptionInfo, type RoutePref, type RouteSpec } from './routeChoice';
 
 export interface PlanInput {
   origin: Place;
@@ -17,12 +18,19 @@ export interface PlanInput {
   passengers: number;
   cargoKg: number;
   climateOn: boolean;
-  avoidTolls: boolean;
+  /** tipo de ruta: rápida, económica, sin TAG o sin peajes */
+  routePref?: RoutePref;
+  /** opción de ruta elegida a mano en el resultado ('rapida', 'alt1', 'sinpeajes'…) */
+  routeKey?: string;
+  /** @deprecated planes antiguos: equivale a routePref 'sinpeajes' */
+  avoidTolls?: boolean;
   calibration: number;
   usableKwh: number;
   tempOrigin: number;
   tempDest: number;
   priceDc: number;
+  /** $/kWh cargando en casa (para comparar rutas cortas) */
+  priceHome?: number;
   gasPrice: number;
   gasKmPerL: number;
   /** hora de salida (ms); por defecto ahora */
@@ -87,6 +95,12 @@ export interface TripPlan {
   routeChargers: RouteCharger[];
   /** peajes y pórticos TAG que cruza la ruta */
   tolls?: TollHit[];
+  /** rutas posibles (rápida, económica, sin peajes…) para elegir */
+  routeOptions?: RouteOptionInfo[];
+  /** opción usada */
+  routeKey?: string;
+  /** cómo rehacer la ruta al recalcular en el camino */
+  routeSpec?: RouteSpec;
   totals: {
     distanceM: number;
     driveMin: number;
@@ -301,8 +315,33 @@ export async function planTrip(input: PlanInput, stations: Station[], signal?: A
   const tempAt = tempInterp(input);
   const warnings: string[] = [];
 
-  // 1) Ruta directa
-  const direct = await getRoute([input.origin.lngLat, input.destination.lngLat], { topSpeed: input.cruiseKmh, avoidTolls: input.avoidTolls }, signal);
+  // 1) Rutas posibles (rápida, alternativas, sin peajes, sin TAG) y la elegida
+  const pref: RoutePref = input.routePref ?? (input.avoidTolls ? 'sinpeajes' : 'rapida');
+  const departAt = input.departAt ?? Date.now();
+  const options = await routeOptions(
+    {
+      from: input.origin.lngLat,
+      to: input.destination.lngLat,
+      topSpeed: input.cruiseKmh,
+      pref,
+      key: input.routeKey,
+      tolls: tollList,
+      od: odList,
+      departAt,
+      energyOf: (r) => {
+        const k = routeEnergy(r, cond, tempAt);
+        return k[k.length - 1];
+      },
+      // si alcanza con la batería se compara con lo que cuesta cargar en casa; si no, con carga rápida
+      priceFor: (kwh) => ((kwh / input.usableKwh) * 100 > input.startSoc - input.arrivalMin ? input.priceDc : input.priceHome ?? 190),
+      needsCharge: (kwh) => (kwh / input.usableKwh) * 100 > input.startSoc - input.arrivalMin,
+    },
+    signal,
+  );
+  const choice = chooseOption(options, pref, input.routeKey);
+  if (choice.warning) warnings.push(choice.warning);
+  const spec = choice.option.spec;
+  const direct = choice.option.route;
   const directKwh = routeEnergy(direct, cond, tempAt);
   const needDirect = (directKwh[directKwh.length - 1] / input.usableKwh) * 100;
 
@@ -337,7 +376,9 @@ export async function planTrip(input: PlanInput, stations: Station[], signal?: A
       if (chain.length) {
         const pts: LngLat[] = [input.origin.lngLat, ...chain.map((c) => [c.cand.station.lng, c.cand.station.lat] as LngLat), input.destination.lngLat];
         try {
-          route = await getRoute(pts, { topSpeed: input.cruiseKmh, avoidTolls: input.avoidTolls }, signal);
+          // tiempo detenido en cada parada (para saber a qué hora pasas por calles con horario)
+          const legDelayMin = chain.map((c) => chargeMinutes(c.arriveSoc, c.departSoc, c.cand.kw, 'DC', tempAt(c.cand.alongM / direct.distanceM), input.usableKwh) + STOP_OVERHEAD_MIN);
+          route = await getRoute(pts, { topSpeed: input.cruiseKmh, ...spec, departAt, legDelayMin }, signal);
           cumKwh = routeEnergy(route, cond, tempAt);
         } catch (e) {
           if ((e as Error).name === 'AbortError') throw e;
@@ -390,6 +431,9 @@ export async function planTrip(input: PlanInput, stations: Station[], signal?: A
     }
   }
 
+  if (route.timed?.wrong.length)
+    warnings.push(`Ojo: a la hora en que pasarías, ${route.timed.wrong.join(', ')} ${route.timed.wrong.length === 1 ? 'tiene' : 'tienen'} otro sentido de tránsito y no encontré cómo evitarla. Respeta la señalización.`);
+
   const arriveSoc = soc[soc.length - 1];
   if (feasible && arriveSoc < input.arrivalMin - 3) warnings.push(`Llegarías con ${Math.round(arriveSoc)} %, bajo tu mínimo de ${input.arrivalMin} %.`);
   if (Math.min(...soc) < 3) {
@@ -409,7 +453,6 @@ export async function planTrip(input: PlanInput, stations: Station[], signal?: A
   if (input.mode === 'eco' && stops.some((s) => s.departSoc > 80)) warnings.push('Alguna parada necesita cargar sobre 80 %.');
 
   // Peajes: hora de paso = salida + manejo + cargas hechas antes de ese punto
-  const departAt = input.departAt ?? Date.now();
   const timeAt = (alongM: number) => {
     let lo = 0;
     let hi = route.cum.length - 1;
@@ -433,6 +476,9 @@ export async function planTrip(input: PlanInput, stations: Station[], signal?: A
     stops,
     routeChargers: chargersAlong(route, stations),
     tolls: tollHits.hits,
+    routeOptions: options.map(optionInfo),
+    routeKey: choice.option.key,
+    routeSpec: spec,
     totals: {
       distanceM: route.distanceM,
       driveMin,

@@ -52,11 +52,35 @@ const norm = (s: string) =>
     .replace(/[̀-ͯ]/g, '')
     .trim();
 
+/** Señal que se cancela con la del llamador o tras `ms` (los servicios a veces quedan colgados) */
+function timeout(ms: number, signal?: AbortSignal): AbortSignal {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(new DOMException('timeout', 'TimeoutError')), ms);
+  signal?.addEventListener('abort', () => (clearTimeout(id), ctrl.abort(signal.reason)));
+  return ctrl.signal;
+}
+
 async function photon(params: URLSearchParams, signal?: AbortSignal): Promise<any[]> {
-  const res = await fetch(`${PHOTON}/api/?${params}`, { signal });
+  const res = await fetch(`${PHOTON}/api/?${params}`, { signal: timeout(6000, signal) });
   if (!res.ok) throw new Error('search failed');
   const json = await res.json();
   return (json.features ?? []).filter((f: any) => !f.properties?.countrycode || f.properties.countrycode === 'CL');
+}
+
+/** Respaldo si Photon no responde: ciudades y pueblos de Chile (Open-Meteo / GeoNames) */
+async function townsFallback(q: string, signal?: AbortSignal): Promise<Place[]> {
+  const params = new URLSearchParams({ name: q, count: '10', language: 'es', countryCode: 'CL', format: 'json' });
+  const res = await fetch(`https://geocoding-api.open-meteo.com/v1/search?${params}`, { signal: timeout(6000, signal) });
+  if (!res.ok) throw new Error('search failed');
+  const json = await res.json();
+  return (json.results ?? []).map((r: any) => ({
+    name: r.name,
+    detail: [(r.admin3 ?? r.admin2 ?? '').replace(/^Comuna de /, ''), (r.admin1 ?? '').replace('Región Metropolitana de Santiago', 'Región Metropolitana').replace(/^Santiago Metropolitan$/, 'Región Metropolitana')]
+      .filter((x: string) => x && x !== r.name)
+      .join(', '),
+    kind: /^PPLA|^PPLC/.test(r.feature_code ?? '') ? 'Ciudad' : 'Localidad',
+    lngLat: [r.longitude, r.latitude] as LngLat,
+  }));
 }
 
 /**
@@ -73,7 +97,15 @@ export async function searchPlaces(q: string, near?: LngLat, signal?: AbortSigna
     generalParams.set('lat', String(near[1]));
     generalParams.set('lon', String(near[0]));
   }
-  const [towns, general] = await Promise.all([photon(townParams, signal).catch(() => []), photon(generalParams, signal)]);
+  let towns: any[];
+  let general: any[];
+  try {
+    [towns, general] = await Promise.all([photon(townParams, signal).catch(() => []), photon(generalParams, signal)]);
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    // Photon caído: al menos ciudades y pueblos (para calles, elegir el punto en el mapa)
+    return townsFallback(q, signal);
+  }
 
   const nq = norm(q);
   const seen = new Set<string>();
@@ -101,7 +133,7 @@ export async function searchPlaces(q: string, near?: LngLat, signal?: AbortSigna
 /** Dirección legible de un punto (para "elegir en el mapa") */
 export async function placeAt(p: LngLat): Promise<Place> {
   try {
-    const res = await fetch(`${PHOTON}/reverse?lon=${p[0]}&lat=${p[1]}&limit=1`);
+    const res = await fetch(`${PHOTON}/reverse?lon=${p[0]}&lat=${p[1]}&limit=1`, { signal: timeout(5000) });
     const json = await res.json();
     const f = json.features?.[0]?.properties;
     if (f) {
@@ -118,7 +150,7 @@ export async function placeAt(p: LngLat): Promise<Place> {
 
 export async function reverseGeocode(p: LngLat): Promise<string | null> {
   try {
-    const res = await fetch(`${PHOTON}/reverse?lon=${p[0]}&lat=${p[1]}&limit=1`);
+    const res = await fetch(`${PHOTON}/reverse?lon=${p[0]}&lat=${p[1]}&limit=1`, { signal: timeout(5000) });
     const json = await res.json();
     const f = json.features?.[0]?.properties;
     if (!f) return null;

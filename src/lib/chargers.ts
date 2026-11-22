@@ -270,4 +270,4 @@ export function shortName(s: SlimStation): string {
 }
 
 // Solo en desarrollo: acceso desde la consola para pruebas
-if (import.meta.env.DEV) (window as unknown as { __chargers: typeof useChargers }).__chargers = useChargers;
+if (import.meta.env?.DEV && typeof window !== 'undefined') (window as unknown as { __chargers: typeof useChargers }).__chargers = useChargers;

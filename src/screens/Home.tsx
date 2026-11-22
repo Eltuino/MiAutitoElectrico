@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
-import { BatteryCharging, ChevronRight, CloudSun, Lightbulb, MapPin, Navigation, Pencil, Route, Timer, Zap, Gauge, Leaf, Building2, Mountain } from 'lucide-react';
+import { BatteryCharging, ChevronRight, CloudSun, Lightbulb, MapPin, Navigation, Pencil, Route, Timer, Zap, Gauge, Leaf, Building2, Mountain, Plus, BookmarkPlus } from 'lucide-react';
+import { useSaved } from '../store/saved';
+import { SAVED_ICON } from '../components/icons';
+import { ROUTE_PREFS } from '../lib/routeChoice';
 import BatteryRing from '../components/BatteryRing';
 import { RangeField, Sheet } from '../components/ui';
 import { ORA5 } from '../lib/car';
@@ -31,7 +34,8 @@ export default function Home() {
   const plan = useTrip((t) => t.plan);
   const history = useTrip((t) => t.history);
   const session = useTimer((t) => t.session);
-  const { go, setNavigating } = useUi();
+  const { go, setNavigating, startQuick, showToast } = useUi();
+  const saved = useSaved((x) => x.routes);
   const stations = useChargers((c) => c.stations);
   const [socOpen, setSocOpen] = useState(false);
   const [socVal, setSocVal] = useState(Math.round(s.soc));
@@ -109,6 +113,62 @@ export default function Home() {
           </div>
         </div>
       </button>
+
+      {/* Rutas frecuentes: un toque calcula desde donde estés y abre la navegación */}
+      {saved.length > 0 ? (
+        <div className="mt16">
+          <div className="row between" style={{ padding: '0 4px 8px' }}>
+            <div className="bold">Tus rutas</div>
+            <div className="tiny muted bold">Toca para salir</div>
+          </div>
+          <div className="saved-row">
+            {saved.map((r) => (
+              <button key={r.id} className="saved-btn" onClick={() => startQuick(r)}>
+                <span className="ic-bubble" style={{ background: 'var(--grad)', color: '#fff' }}>
+                  {SAVED_ICON[r.kind]}
+                </span>
+                <div style={{ minWidth: 0 }}>
+                  <div className="bold ellipsis" style={{ fontSize: 15.5 }}>
+                    {r.name}
+                  </div>
+                  <div className="tiny muted ellipsis">{r.destination.name}</div>
+                  <div className="tiny bold ellipsis" style={{ color: 'var(--primary)', marginTop: 2 }}>
+                    {ROUTE_PREFS[r.routePref].short}
+                  </div>
+                </div>
+              </button>
+            ))}
+            <button
+              className="saved-btn add"
+              onClick={() => {
+                go('trip');
+                showToast('Calcula el viaje y toca "Guardar como ruta frecuente"');
+              }}
+            >
+              <Plus size={22} />
+              <span className="small">Agregar</span>
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          className="card mt12 row"
+          style={{ width: '100%', textAlign: 'left', boxShadow: 'none', border: '2px dashed var(--line)', background: 'transparent' }}
+          onClick={() => {
+            go('trip');
+            showToast('Calcula el viaje y toca "Guardar como ruta frecuente"');
+          }}
+        >
+          <span className="ic-bubble">
+            <BookmarkPlus size={20} />
+          </span>
+          <div className="grow">
+            <div className="bold">Guarda tus rutas de siempre</div>
+            <div className="small muted">Casa, Trabajo… y sales con un toque, incluso sin internet.</div>
+          </div>
+          <ChevronRight className="muted" />
+        </button>
+      )}
 
       {/* Carga activa */}
       {charge && session && (

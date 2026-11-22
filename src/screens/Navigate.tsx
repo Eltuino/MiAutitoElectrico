@@ -24,6 +24,7 @@ import {
   PartyPopper,
   Gauge,
   MapPinned,
+  WifiOff,
 } from 'lucide-react';
 import MapView, { drawChargerDots, drawRoute, fitTo, htmlMarker, isNight, maplibregl } from '../components/MapView';
 import BatteryRing from '../components/BatteryRing';
@@ -40,7 +41,10 @@ import { getRoute, maneuverIcon, ARRIVE_TYPES } from '../lib/routing';
 import { chargersAlong, googleMapsUrl } from '../lib/planner';
 import { chargerAlertText, farText, isFastCharger, maneuverThresholds, navFromPlan, rebuildNav, spokenName, type NavRoute } from '../lib/nav';
 import { chime, keepScreenOn, speak, unlockSpeech, vibrate, ensureNotifications, notify, stopSpeaking } from '../lib/voice';
-import { fmtDuration, fmtKm, fmtTime, speakDistance } from '../lib/format';
+import { downloadRoute, isDownloaded } from '../lib/offlineMap';
+import { optionTitle } from '../lib/routeChoice';
+import { loadTimedStreets, streetNames, timeAlong, wrongWays } from '../lib/timedStreets';
+import { fmtCLP, fmtDuration, fmtKm, fmtTime, speakDistance } from '../lib/format';
 
 const PROGRESS_KEY = 'mae.nav.v1';
 
@@ -65,7 +69,25 @@ interface NavState {
   lastSave: number;
   lastRender: number;
   lastFix: number;
+  /** última lectura GPS precisa (≤ 45 m) */
+  lastGoodFix: number;
+  /** velocidad de la última lectura precisa (km/h) */
+  gpsSpeed: number;
+  /** sin GPS (túnel): avanzamos por la ruta a la última velocidad conocida */
+  dr: boolean;
+  drStart: number;
+  drAlong0: number;
+  drLast: number;
+  /** no evaluar "fuera de ruta" hasta este momento (recién salimos de un túnel / sin internet) */
+  graceUntil: number;
+  offlineNotified: boolean;
 }
+
+/** Hasta dónde estimar la posición sin GPS (los túneles largos de Santiago tienen ~4 km) */
+const DR_MAX_MS = 4 * 60000;
+const DR_MAX_M = 5000;
+/** lecturas peores que esto no se usan para decidir si nos salimos de la ruta */
+const GOOD_ACC_M = 45;
 
 const ICONS = {
   straight: ArrowUp,
@@ -132,7 +154,29 @@ export default function Navigate() {
     lastSave: 0,
     lastRender: 0,
     lastFix: 0,
+    lastGoodFix: 0,
+    gpsSpeed: 0,
+    dr: false,
+    drStart: 0,
+    drAlong0: 0,
+    drLast: 0,
+    graceUntil: 0,
+    offlineNotified: false,
   });
+  const arrivalOpen = useRef(false);
+  const [online, setOnline] = useState(() => navigator.onLine);
+  useEffect(() => {
+    arrivalOpen.current = arrivalStop !== null;
+  }, [arrivalStop]);
+  useEffect(() => {
+    const on = () => setOnline(navigator.onLine);
+    window.addEventListener('online', on);
+    window.addEventListener('offline', on);
+    return () => {
+      window.removeEventListener('online', on);
+      window.removeEventListener('offline', on);
+    };
+  }, []);
 
   // Restaurar progreso si se cerró la app a mitad de viaje
   useEffect(() => {
@@ -206,7 +250,7 @@ export default function Navigate() {
   // -------------------------------------------------------------------------
   // Lógica principal: cada nueva posición
   const update = useCallback(
-    (pos: LngLat, speedKmh: number, heading: number | null, known?: { along: number; idx: number }) => {
+    (pos: LngLat, speedKmh: number, heading: number | null, known?: { along: number; idx: number }, accuracy = 20) => {
       const st = s.current;
       const n = nav.current;
       if (!n || !plan || st.finished) return;
@@ -224,14 +268,26 @@ export default function Navigate() {
         // si pasó mucho rato sin GPS (app en segundo plano), buscar en toda la ruta
         const fresh = st.pos && now - st.lastFix < 30000;
         st.lastFix = now;
-        const snap = snapToRoute(pos, r.coords, r.cum, fresh ? st.idx : undefined);
+        const wasDr = st.dr;
+        // al salir de un túnel buscamos más adelante (la estimación pudo quedarse corta)
+        const snap = snapToRoute(pos, r.coords, r.cum, fresh ? st.idx : undefined, wasDr ? 80 : 30, wasDr ? 1200 : 400);
         along = snap.along;
         idx = snap.index;
-        // fuera de ruta → recalcular
-        if (snap.dist > 70) {
+        if (accuracy <= GOOD_ACC_M) {
+          st.lastGoodFix = now;
+          st.gpsSpeed = speedKmh;
+          if (wasDr) {
+            // volvió el GPS: las primeras lecturas suelen venir corridas, damos unos segundos antes de recalcular
+            st.dr = false;
+            st.graceUntil = now + 20000;
+          }
+        }
+        // ¿fuera de ruta? Solo con GPS preciso, varios segundos seguidos y fuera del período de gracia
+        const offLimit = Math.max(70, accuracy * 1.5);
+        if (snap.dist > offLimit && accuracy <= 35) {
           if (!st.offSince) st.offSince = now;
-          if (now - st.offSince > 9000 && !st.rerouting) reroute(pos);
-        } else st.offSince = 0;
+          if (now - st.offSince > 12000 && now > st.graceUntil && !st.rerouting) reroute(pos);
+        } else if (snap.dist <= offLimit) st.offSince = 0;
       }
       st.pos = pos;
       st.along = along;
@@ -382,13 +438,31 @@ export default function Navigate() {
     const st = s.current;
     const n = nav.current;
     if (!plan || !n) return;
+    // Sin internet no se puede recalcular: mantener la ruta y las indicaciones (no "volverse loco")
+    if (!navigator.onLine) {
+      st.offSince = 0;
+      st.graceUntil = Date.now() + 60000;
+      if (!st.offlineNotified) {
+        st.offlineNotified = true;
+        speak('Estás sin internet, así que no puedo recalcular. Sigo con la ruta planificada: vuelve a ella cuando puedas.');
+      }
+      render();
+      return;
+    }
     st.rerouting = true;
     render();
     speak(message);
     try {
       const remaining = override ?? n.stops.filter((x) => !st.arrived.has(x.station.id) && x.navAlong > st.along);
       const pts: LngLat[] = [pos, ...remaining.map((x) => [x.station.lng, x.station.lat] as LngLat), plan.input.destination.lngLat];
-      const route = await getRoute(pts, { topSpeed: plan.input.cruiseKmh, avoidTolls: plan.input.avoidTolls });
+      // mismo tipo de ruta que eligió (sin peajes, sin TAG, económica…)
+      const route = await getRoute(pts, {
+        topSpeed: plan.input.cruiseKmh,
+        ...(plan.routeSpec ?? { excludeTolls: plan.input.avoidTolls }),
+        // a la hora de ahora: calles reversibles, vías exclusivas…
+        departAt: Date.now(),
+        legDelayMin: remaining.map((x) => x.chargeMin + 5),
+      });
       const socNow = socAt(n, st.idx, st.along) + st.socOffset;
       nav.current = rebuildNav(plan, route, socNow, remaining, chargersAlong(route, useChargers.getState().stations));
       st.socOffset = 0;
@@ -399,7 +473,10 @@ export default function Navigate() {
       for (const k of [...st.fired]) if (k.startsWith('m-')) st.fired.delete(k);
       drawAll();
     } catch {
-      showToast('No pude recalcular la ruta');
+      // sin señal de datos (túnel, zona rural): seguimos con la ruta que teníamos
+      st.offSince = 0;
+      st.graceUntil = Date.now() + 45000;
+      showToast('Sin conexión: sigo con la ruta planificada');
     } finally {
       st.rerouting = false;
       render();
@@ -543,10 +620,15 @@ export default function Navigate() {
     s.current.source = 'gps';
     watchId.current = navigator.geolocation.watchPosition(
       (p) => {
-        if (p.coords.accuracy > 120) return; // lectura muy imprecisa
-        const speed = p.coords.speed != null && p.coords.speed >= 0 ? p.coords.speed * 3.6 : s.current.speedKmh;
+        const st = s.current;
+        const acc = p.coords.accuracy;
+        if (acc > 120) return; // lectura muy imprecisa
+        // En túneles el GPS se pierde o "salta" con lecturas malas: mientras tanto seguimos
+        // estimando la posición sobre la ruta en vez de creer que nos salimos
+        if (acc > GOOD_ACC_M && (st.dr || Date.now() - st.lastGoodFix < 15000)) return;
+        const speed = p.coords.speed != null && p.coords.speed >= 0 ? p.coords.speed * 3.6 : st.speedKmh;
         const heading = p.coords.heading != null && !isNaN(p.coords.heading) && speed > 6 ? p.coords.heading : null;
-        update([p.coords.longitude, p.coords.latitude], speed, heading);
+        update([p.coords.longitude, p.coords.latitude], speed, heading, undefined, acc);
       },
       (err) => {
         showToast(err.code === err.PERMISSION_DENIED ? 'Activa el permiso de ubicación para navegar' : 'Sin señal GPS…');
@@ -608,7 +690,75 @@ export default function Navigate() {
     );
     if (source === 'gps') startGps();
     else startSim();
+    // guardar el mapa del camino por si se pierde la señal (lo ya guardado no se vuelve a bajar)
+    if (navigator.onLine && !isDownloaded(plan!.id) && n.route.distanceM < 250000) downloadRoute(plan!.id, n.route.coords).catch(() => {});
+    void checkTimedNow();
   }
+
+  /**
+   * El plan pudo calcularse para otra hora (ruta guardada, "Seguir viaje"): revisar las calles
+   * reversibles a la hora real y, si alguna va en contra, recalcular (o avisar si no hay internet).
+   */
+  async function checkTimedNow() {
+    const idx = await loadTimedStreets();
+    const n = nav.current;
+    const st = s.current;
+    if (!idx || !n || !plan) return;
+    const r = n.route;
+    const departAt = Date.now() - (r.cumT[st.idx] ?? 0) * 1000;
+    const bad = wrongWays(r, idx, timeAlong(r, departAt, n.stops.map((x) => x.chargeMin + 5))).filter(
+      (w) => w.alongM > st.along + 150 && w.alongM < r.distanceM - 150,
+    );
+    if (!bad.length) return;
+    const names = streetNames(bad);
+    const what = names.length ? names.join(', ') : 'una calle de tu ruta';
+    if (!navigator.onLine) {
+      speak(`Ojo: a esta hora ${what} tiene otro sentido de tránsito. Sin internet no puedo cambiar la ruta: respeta la señalización.`, { priority: true });
+      return;
+    }
+    const pos = st.pos ?? pointAt(r.coords, r.cum, st.along).point;
+    reroute(pos, undefined, `A esta hora ${what} cambia de sentido. Ajusto la ruta.`);
+  }
+
+  // Sin GPS (túnel): avanzar por la ruta a la última velocidad para que los avisos de salida sigan llegando
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const st = s.current;
+      const n = nav.current;
+      if (!st.started || st.finished || st.source !== 'gps' || !n || st.rerouting || arrivalOpen.current) return;
+      const now = Date.now();
+      if (!st.lastGoodFix || now - st.lastGoodFix < 3500 || st.gpsSpeed < 12) {
+        if (st.dr && now - st.lastGoodFix < 3500) st.dr = false;
+        return;
+      }
+      if (!st.dr) {
+        st.dr = true;
+        st.drStart = now;
+        st.drAlong0 = st.along;
+        st.drLast = now;
+        render();
+        return;
+      }
+      const dt = (now - st.drLast) / 1000;
+      st.drLast = now;
+      // túnel muy largo o auto detenido adentro: dejamos de avanzar y esperamos al GPS
+      if (now - st.drStart > DR_MAX_MS || st.along - st.drAlong0 > DR_MAX_M) return;
+      const r = n.route;
+      // la última velocidad real (en un túnel se suele mantener); tope por el tipo de vía para no adelantarse
+      // demasiado. Mejor avisar una salida un poco antes que tarde.
+      const v = Math.min(st.gpsSpeed, Math.max(40, (r.speed[st.idx] ?? st.gpsSpeed) * 1.5));
+      const along = Math.min(r.distanceM - 1, st.along + (v / 3.6) * dt);
+      const { point, index } = pointAt(r.coords, r.cum, along);
+      const ahead = pointAt(r.coords, r.cum, along + 35).point;
+      update(point, v, bearing(point, ahead), { along, idx: index });
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [update]);
+
+  // Para pruebas en desarrollo
+  useEffect(() => {
+    if (import.meta.env.DEV) (window as unknown as { __nav: unknown }).__nav = { s, nav, update };
+  }, [update]);
 
   useEffect(() => {
     loadTolls().then((d) => {
@@ -698,6 +848,20 @@ export default function Navigate() {
               </div>
             </div>
           </div>
+          {(st.dr || !online) && st.source === 'gps' && (
+            <div className="row mt8" style={{ gap: 6, flexWrap: 'wrap' }}>
+              {st.dr && (
+                <span className="badge warn" style={{ background: '#fff', boxShadow: 'var(--shadow)' }}>
+                  <span className="dot" /> Sin GPS (¿túnel?) · estimando tu posición
+                </span>
+              )}
+              {!online && (
+                <span className="badge off" style={{ background: '#fff', boxShadow: 'var(--shadow)' }}>
+                  <WifiOff size={12} /> Sin internet · sigo la ruta guardada
+                </span>
+              )}
+            </div>
+          )}
           {nextCharger && ncSum && (
             <div className="card row mt8" style={{ padding: '10px 14px', borderRadius: 18, gap: 10 }}>
               <span className="ic-bubble" style={{ width: 34, height: 34, borderRadius: 11, background: ncIsStop ? 'var(--primary)' : 'var(--primary-soft)', color: ncIsStop ? '#fff' : 'var(--primary)' }}>
@@ -749,6 +913,12 @@ export default function Navigate() {
                   <div className="small muted">
                     {fmtKm(plan.totals.distanceM)} · {fmtDuration(plan.totals.totalMin)} · {plan.stops.length} {plan.stops.length === 1 ? 'parada' : 'paradas'}
                   </div>
+                  {plan.routeOptions && plan.routeOptions.length > 0 && (
+                    <div className="tiny bold" style={{ color: 'var(--primary)' }}>
+                      Ruta {optionTitle(plan.routeOptions.find((o) => o.key === plan.routeKey) ?? plan.routeOptions[0]).toLowerCase()} ·{' '}
+                      {plan.totals.tollClp ? `peajes y TAG ${fmtCLP(plan.totals.tollClp)}` : 'sin peajes'}
+                    </div>
+                  )}
                 </div>
               </div>
               <button className="btn primary block mt12" style={{ height: 56 }} onClick={() => begin('gps')}>

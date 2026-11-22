@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import type { CarColorKey } from '../lib/car';
+import type { RoutePref } from '../lib/routeChoice';
 
 export type TripMode = 'rapido' | 'equilibrado' | 'eco';
 export type Cargo = 'liviano' | 'normal' | 'full';
@@ -32,7 +33,10 @@ export interface Settings {
   cargo: Cargo;
   arrivalMin: number;
   climateOn: boolean;
-  avoidTolls: boolean;
+  /** tipo de ruta por defecto */
+  routePref: RoutePref;
+  /** @deprecated reemplazado por routePref */
+  avoidTolls?: boolean;
   // Voz y avisos
   voiceOn: boolean;
   voiceTurns: boolean;
@@ -62,7 +66,7 @@ export const useSettings = create<Settings>()(
       cargo: 'normal',
       arrivalMin: 15,
       climateOn: true,
-      avoidTolls: false,
+      routePref: 'economica',
       voiceOn: true,
       voiceTurns: true,
       voiceChargers: true,
@@ -77,6 +81,13 @@ export const useSettings = create<Settings>()(
     }),
     {
       name: 'mae.settings.v1',
+      version: 2,
+      // v1 tenía "Evitar peajes" (sí/no): se convierte en el tipo de ruta
+      migrate: (persisted, version) => {
+        const p = (persisted ?? {}) as Partial<Settings>;
+        if (version < 2) return { ...p, routePref: p.avoidTolls ? 'sinpeajes' : 'economica' } as Settings;
+        return p as Settings;
+      },
       storage: createJSONStorage(() => {
         try {
           localStorage.setItem('__t', '1');

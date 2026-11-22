@@ -38,7 +38,7 @@ function save(key: string, v: unknown) {
 }
 
 /** Redondea arreglos grandes para que el viaje quepa en el almacenamiento local */
-function compactPlan(p: TripPlan): TripPlan {
+export function compactPlan(p: TripPlan): TripPlan {
   const r6 = (n: number) => Math.round(n * 1e6) / 1e6;
   const r1 = (n: number) => Math.round(n * 10) / 10;
   const r3 = (n: number) => Math.round(n * 1000) / 1000;

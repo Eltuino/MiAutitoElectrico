@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import type { Map as MlMap, Marker } from 'maplibre-gl';
-import MapView, { drawChargerDots, drawRoute, fitTo, htmlMarker, maplibregl } from './MapView';
+import MapView, { drawAlternatives, drawChargerDots, drawRoute, fitTo, htmlMarker, maplibregl } from './MapView';
 import type { TripPlan } from '../lib/planner';
 import { summarize, STATE_COLOR } from '../lib/chargers';
 import { fmtCLP } from '../lib/format';
@@ -15,6 +15,10 @@ export default function TripMap({ plan, height = 300, onStopClick }: { plan: Tri
     markers.current.forEach((m) => m.remove());
     markers.current = [];
     drawRoute(map, plan.route.coords, plan.soc, plan.route.cum);
+    drawAlternatives(
+      map,
+      (plan.routeOptions ?? []).filter((o) => o.key !== plan.routeKey && o.preview?.length > 1).map((o) => o.preview),
+    );
 
     // Cargadores rápidos en el camino (capa de puntos)
     const stopIds = new Set(plan.stops.map((s) => s.station.id));

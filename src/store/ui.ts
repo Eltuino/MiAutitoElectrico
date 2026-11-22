@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type { Station } from '../lib/chargers';
+import type { SavedRoute } from './saved';
 
 export type Tab = 'home' | 'trip' | 'chargers' | 'timer' | 'settings';
 
@@ -19,7 +20,11 @@ interface UiState {
   timerPrefill?: TimerPrefill;
   focusStation?: Station;
   toast?: { text: string; id: number };
+  /** ruta guardada que se pidió desde Inicio: calcular y partir */
+  quickRoute?: SavedRoute;
   go: (tab: Tab) => void;
+  startQuick: (r: SavedRoute) => void;
+  clearQuick: () => void;
   setNavigating: (v: boolean) => void;
   openTimer: (p: TimerPrefill) => void;
   clearTimerPrefill: () => void;
@@ -32,6 +37,8 @@ export const useUi = create<UiState>((set) => ({
   tab: 'home',
   navigating: false,
   go: (tab) => set({ tab }),
+  startQuick: (r) => set({ quickRoute: r, tab: 'trip', navigating: false }),
+  clearQuick: () => set({ quickRoute: undefined }),
   setNavigating: (navigating) => set({ navigating }),
   openTimer: (p) => set({ timerPrefill: p, tab: 'timer', navigating: false }),
   clearTimerPrefill: () => set({ timerPrefill: undefined }),

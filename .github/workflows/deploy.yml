@@ -30,6 +30,9 @@ jobs:
       - name: Actualizar respaldo de cargadores (SEC)
         run: npm run snapshot
         continue-on-error: true
+      - name: Actualizar calles reversibles (OpenStreetMap)
+        run: npm run streets
+        continue-on-error: true
       - name: Compilar
         run: npm run build
         env:

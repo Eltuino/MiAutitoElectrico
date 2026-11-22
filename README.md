@@ -5,13 +5,14 @@ Es una app web instalable (PWA): funciona en iPhone y Android desde el navegador
 
 ## Qué hace
 
-- **Inicio**: el Ora 5 en 3D (con los 6 colores oficiales), batería actual, autonomía estimada según clima y uso, consejos.
-- **Planificar viaje**: origen/destino, % de batería al salir y mínimo al llegar, modo **Rápido / Equilibrado / Eco (cuida la batería, 20–80 %)**, velocidad, pasajeros, carga (liviano/normal/full), clima y peajes.
-  Calcula la ruta real con pendientes y temperatura, elige las **paradas de carga óptimas** entre los cargadores públicos de Chile, y muestra tiempos de carga, costo, ahorro vs bencina, el mapa coloreado por batería y el gráfico de batería + elevación.
-- **Modo viaje**: navegación con mapa 3D, indicaciones de giro por voz ("En 400 metros, gire a la derecha…"), avisos de cargadores a **5 km, 2 km y 1 km** con su disponibilidad en vivo, batería estimada en tiempo real (corregible), recálculo si te sales de la ruta, aviso de batería baja y simulador para probar sin manejar.
+- **Inicio**: batería actual, autonomía estimada según clima y uso, **tus rutas frecuentes** (Casa, Trabajo…: un toque calcula desde donde estés y abre la navegación), consejos.
+- **Planificar viaje**: origen/destino, % de batería al salir y mínimo al llegar, modo **Rápido / Equilibrado / Eco (cuida la batería, 20–80 %)**, velocidad, pasajeros, carga (liviano/normal/full), clima, hora de salida y **tipo de ruta: más rápida, más económica, sin TAG o sin peajes**.
+  Calcula la ruta real con pendientes y temperatura, elige las **paradas de carga óptimas** entre los cargadores públicos de Chile, y muestra las **rutas posibles con su tiempo y costo** (peajes/TAG a la hora de paso + energía), tiempos de carga, ahorro vs bencina, el mapa coloreado por batería y el gráfico de batería + elevación.
+- **Modo viaje**: navegación con mapa 3D, indicaciones de giro por voz ("En 400 metros, gire a la derecha…"), avisos de cargadores a **5 km, 2 km y 1 km** con su disponibilidad en vivo, batería estimada en tiempo real (corregible), recálculo si te sales de la ruta (con el mismo tipo de ruta), aviso de batería baja y simulador para probar sin manejar.
+  **Túneles y sin señal**: si se pierde el GPS sigue avanzando por la ruta a tu última velocidad (los avisos de salida no se pierden), no recalcula con lecturas malas ni sin internet, y el mapa del camino queda descargado.
 - **Cargadores**: mapa y lista de todos los cargadores públicos de Chile con **estado en vivo** (disponible / ocupado / no disponible), potencia, precio por kWh y horario.
 - **Cronómetro de carga**: dices con cuánto partes, hasta cuánto quieres cargar y el tipo de cargador; calcula el tiempo con la curva de carga del Ora 5 y **te avisa con voz, sonido y notificación** al llegar a cada % (también puede crear un recordatorio en el calendario).
-- **Ajustes**: calibrar con tu consumo real (km/kWh del computador del auto), voz, precios.
+- **Ajustes**: calibrar con tu consumo real (km/kWh del computador del auto), voz, precios, rutas frecuentes y **mapas sin conexión** (el de cada viaje se guarda solo; también se puede bajar todo Santiago, ~45 MB).
 
 ## Usarla en el computador (desarrollo)
 
@@ -49,8 +50,9 @@ En Android también se puede usar pantalla dividida.
 | Cargadores y estado en vivo | Plataforma de interoperabilidad SEC (`cargadorespublicos.cl/api/data`) |
 | Rutas e instrucciones en español | Valhalla (FOSSGIS) sobre OpenStreetMap |
 | Mapa | OpenFreeMap © OpenStreetMap |
-| Búsqueda de lugares | Photon (Komoot) |
+| Búsqueda de lugares | Photon (Komoot); si no responde, ciudades y pueblos de Open-Meteo (GeoNames) |
 | Clima y temperatura | Open-Meteo |
+| Calles según la hora | Reversibles (`oneway:conditional`) de OpenStreetMap en `public/data/timed-streets.json` (las revisa la app); vías exclusivas, ciclorrecreovías y ferias las aplica Valhalla con la hora de salida |
 | Peajes y TAG (autos) | Tarifas oficiales 2026 MOP – Dirección General de Concesiones + ubicaciones OpenStreetMap |
 
 `npm run snapshot` actualiza la copia de respaldo de cargadores (`public/data/chargers-snapshot.json`) que se usa sin conexión.

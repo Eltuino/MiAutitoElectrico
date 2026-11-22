@@ -119,6 +119,41 @@ export function drawRoute(map: MlMap, coords: LngLat[], soc?: number[], cum?: nu
   }
 }
 
+/** Otras rutas posibles en gris, debajo de la ruta elegida */
+export function drawAlternatives(map: MlMap, lines: LngLat[][], id = 'route-alts') {
+  const data = {
+    type: 'FeatureCollection' as const,
+    features: lines.map((coordinates) => ({ type: 'Feature' as const, properties: {}, geometry: { type: 'LineString' as const, coordinates } })),
+  };
+  const src = map.getSource(id) as maplibregl.GeoJSONSource | undefined;
+  if (src) {
+    src.setData(data);
+    return;
+  }
+  map.addSource(id, { type: 'geojson', data });
+  const before = map.getLayer('route-casing') ? 'route-casing' : undefined;
+  map.addLayer(
+    {
+      id: `${id}-casing`,
+      type: 'line',
+      source: id,
+      layout: { 'line-join': 'round', 'line-cap': 'round' },
+      paint: { 'line-color': '#ffffff', 'line-width': ['interpolate', ['linear'], ['zoom'], 5, 5, 14, 11] },
+    },
+    before,
+  );
+  map.addLayer(
+    {
+      id: `${id}-line`,
+      type: 'line',
+      source: id,
+      layout: { 'line-join': 'round', 'line-cap': 'round' },
+      paint: { 'line-color': '#9fb0cf', 'line-width': ['interpolate', ['linear'], ['zoom'], 5, 3, 14, 6] },
+    },
+    before,
+  );
+}
+
 /** Puntos de cargadores como capa (escala con el zoom, no tapa la ruta) */
 export function drawChargerDots(map: MlMap, points: { lng: number; lat: number; color: string }[], id = 'route-chargers') {
   const data = {
