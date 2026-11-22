@@ -37,7 +37,7 @@ import { chargeMinutes } from '../lib/car';
 import type { PlannedStop } from '../lib/planner';
 import { loadTolls, tollPriceAt, tollsOnRoute, type OdSystem, type TollHit, type TollPoint } from '../lib/tolls';
 import { bearing, pointAt, snapToRoute, haversine, type LngLat } from '../lib/geo';
-import { getRoute, maneuverIcon, ARRIVE_TYPES } from '../lib/routing';
+import { getRoute, maneuverIcon, fetchLanes, laneHint, ARRIVE_TYPES, type Lane, type Maneuver } from '../lib/routing';
 import { chargersAlong, googleMapsUrl } from '../lib/planner';
 import { chargerAlertText, farText, isFastCharger, maneuverThresholds, navFromPlan, rebuildNav, spokenName, type NavRoute } from '../lib/nav';
 import { chime, keepScreenOn, speak, unlockSpeech, vibrate, ensureNotifications, notify, stopSpeaking } from '../lib/voice';
@@ -307,11 +307,15 @@ export default function Navigate() {
         const th = maneuverThresholds(roadKmh);
         const key = `m-${mi}-${Math.round(m.alongM)}`;
         if (dist <= th.near && !st.fired.has(`${key}-near`)) {
+          // si no alcanzó a sonar el aviso anticipado, la pista va en este
+          const hint = !st.fired.has(`${key}-far`) ? laneHint(m.lanes) : null;
           st.fired.add(`${key}-near`).add(`${key}-far`);
-          speak(stopWording(m.pre ?? m.instruction, m.leg < r.legEnds.length - 1));
+          speak(stopWording(m.pre ?? m.instruction, m.leg < r.legEnds.length - 1) + (hint ? `. Usa ${hint}.` : ''));
         } else if (dist <= th.far && dist > th.near * 1.8 && !st.fired.has(`${key}-far`)) {
           st.fired.add(`${key}-far`);
-          speak(stopWording(farText(m, Math.round(dist / 50) * 50), m.leg < r.legEnds.length - 1));
+          // con las pistas de OpenStreetMap: "Usa las 2 pistas de la derecha"
+          const hint = laneHint(m.lanes);
+          speak(stopWording(farText(m, Math.round(dist / 50) * 50), m.leg < r.legEnds.length - 1) + (hint ? `. Usa ${hint}.` : ''));
         }
       }
 
@@ -470,6 +474,8 @@ export default function Navigate() {
       st.idx = 0;
       st.offSince = 0;
       computeTolls();
+      // pistas de la nueva ruta (en segundo plano)
+      fetchLanes(route).then(render).catch(() => {});
       for (const k of [...st.fired]) if (k.startsWith('m-')) st.fired.delete(k);
       drawAll();
     } catch {
@@ -688,6 +694,8 @@ export default function Navigate() {
       `${resumed ? 'Seguimos' : 'Comenzamos'}. ${left} hasta ${plan!.input.destination.name}${stops ? `, con ${stops} ${stops === 1 ? 'parada' : 'paradas'} de carga` : ''}. ${first ? first.pre ?? '' : ''}`,
       { priority: true },
     );
+    // pistas y letreros de salida (en segundo plano; si no hay internet se navega igual)
+    if (navigator.onLine && !n.route.maneuvers.some((x) => x.lanes)) fetchLanes(n.route).then(render).catch(() => {});
     if (source === 'gps') startGps();
     else startSim();
     // guardar el mapa del camino por si se pierde la señal (lo ya guardado no se vuelve a bajar)
@@ -848,6 +856,7 @@ export default function Navigate() {
               </div>
             </div>
           </div>
+          {m && !st.rerouting && <ManeuverExtras m={m} dist={mDist} />}
           {(st.dr || !online) && st.source === 'gps' && (
             <div className="row mt8" style={{ gap: 6, flexWrap: 'wrap' }}>
               {st.dr && (
@@ -1131,6 +1140,56 @@ export default function Navigate() {
 }
 
 // ---------------------------------------------------------------------------
+
+const LANE_ICON: Record<string, typeof ArrowUp> = {
+  straight: ArrowUp,
+  right: CornerUpRight,
+  'sharp right': CornerUpRight,
+  'slight right': ArrowUpRight,
+  left: CornerUpLeft,
+  'sharp left': CornerUpLeft,
+  'slight left': ArrowUpLeft,
+  uturn: Undo2,
+  'merge to left': Merge,
+  'merge to right': Merge,
+};
+
+/** Letrero verde de salida y pistas a usar, como en las autopistas */
+function ManeuverExtras({ m, dist }: { m: Maneuver; dist: number }) {
+  const showSign = !!m.sign && dist < (m.highway ? 4000 : 1200);
+  const showLanes = !!m.lanes && dist < (m.highway || m.sign ? 2500 : 700);
+  if (!showSign && !showLanes) return null;
+  const where = [...(m.sign?.branch ?? []), ...(m.sign?.toward ?? [])].filter((x, i, a) => a.indexOf(x) === i);
+  return (
+    <div className="mt8" style={{ display: 'grid', gap: 6 }}>
+      {showSign && (where.length > 0 || m.sign?.exit) && (
+        <div className="exit-sign">
+          {m.sign?.exit && <span className="exit-num">Salida {m.sign.exit}</span>}
+          <span className="exit-to">{where.length ? where.join(' · ') : m.sign?.name}</span>
+        </div>
+      )}
+      {showLanes && <LaneStrip lanes={m.lanes!} />}
+    </div>
+  );
+}
+
+function LaneStrip({ lanes }: { lanes: Lane[] }) {
+  const anyBest = lanes.some((l) => l.best);
+  return (
+    <div className="lane-strip" aria-label="Pistas">
+      {lanes.map((l, i) => {
+        const good = anyBest ? l.best : l.ok;
+        const ind = (good ? l.use : undefined) ?? l.ind.find((x) => x !== 'none') ?? 'straight';
+        const Icon = LANE_ICON[ind] ?? ArrowUp;
+        return (
+          <span key={i} className={`lane ${good ? 'on' : ''}`}>
+            <Icon size={24} strokeWidth={good ? 3 : 2.4} />
+          </span>
+        );
+      })}
+    </div>
+  );
+}
 
 function socAt(n: NavRoute, idx: number, along: number): number {
   const r = n.route;

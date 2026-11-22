@@ -15,10 +15,11 @@ const QUERY = `[out:json][timeout:240];
 out tags geom;`;
 
 async function overpass(q) {
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < 2; attempt++) {
     for (const host of HOSTS) {
       try {
         const r = await fetch(host, {
+          signal: AbortSignal.timeout(120000),
           method: 'POST',
           body: 'data=' + encodeURIComponent(q),
           headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json', 'User-Agent': 'MiAutitoElectrico-data/1.0' },

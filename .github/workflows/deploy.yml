@@ -33,6 +33,8 @@ jobs:
       - name: Actualizar calles reversibles (OpenStreetMap)
         run: npm run streets
         continue-on-error: true
+        # si Overpass está lento se publica con los datos que ya hay en el repositorio
+        timeout-minutes: 5
       - name: Compilar
         run: npm run build
         env:

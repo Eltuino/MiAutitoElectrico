@@ -1,4 +1,4 @@
-import { cumulativeDistances, decodePolyline6, haversine, type LngLat } from './geo';
+import { cumulativeDistances, decodePolyline6, haversine, snapToRoute, type LngLat } from './geo';
 import { loadTimedStreets, streetNames, timeAlong, wrongWays, type DirectedPoint } from './timedStreets';
 
 const VALHALLA = 'https://valhalla1.openstreetmap.de/route';
@@ -22,6 +22,21 @@ export interface Maneuver {
   alongM: number;
   /** índice de tramo (leg) al que pertenece */
   leg: number;
+  /** letrero de salida (autopistas): número, ramal, hacia dónde */
+  sign?: { exit?: string; branch?: string[]; toward?: string[]; name?: string };
+  /** pistas al llegar a la maniobra (de izquierda a derecha), si OpenStreetMap las tiene */
+  lanes?: Lane[];
+}
+
+export interface Lane {
+  /** flechas pintadas en la pista: straight, left, slight right… */
+  ind: string[];
+  /** sirve para esta maniobra */
+  ok: boolean;
+  /** la recomendada */
+  best: boolean;
+  /** flecha que corresponde usar */
+  use?: string;
 }
 
 export interface Route {
@@ -220,6 +235,7 @@ function parseTrip(trip: any): Route {
         highway: !!m.highway,
         alongM: 0,
         leg: li,
+        sign: parseSign(m.sign),
       });
       const v = m.length > 0 && m.time > 0 ? (m.length / m.time) * 3600 : 30;
       for (let k = begin; k < end; k++) speed[k] = v;
@@ -277,6 +293,110 @@ function parseTrip(trip: any): Route {
     hasToll: !!trip.summary.has_toll,
     hasHighway: !!trip.summary.has_highway,
   };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function parseSign(s: any): Maneuver['sign'] {
+  if (!s) return undefined;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const texts = (list: any) => ((list ?? []) as { text: string }[]).map((x) => x.text).filter(Boolean);
+  const sign = {
+    exit: texts(s.exit_number_elements)[0],
+    branch: texts(s.exit_branch_elements),
+    toward: texts(s.exit_toward_elements),
+    name: texts(s.exit_name_elements)[0],
+  };
+  return sign.exit || sign.branch.length || sign.toward.length || sign.name ? sign : undefined;
+}
+
+const TRACE = 'https://valhalla1.openstreetmap.de/trace_route';
+
+function encodePolyline6(coords: LngLat[]): string {
+  let out = '';
+  let pLat = 0;
+  let pLng = 0;
+  const enc = (v: number) => {
+    v = v < 0 ? ~(v << 1) : v << 1;
+    let s = '';
+    while (v >= 0x20) {
+      s += String.fromCharCode((0x20 | (v & 0x1f)) + 63);
+      v >>= 5;
+    }
+    return s + String.fromCharCode(v + 63);
+  };
+  for (const [lng, lat] of coords) {
+    const a = Math.round(lat * 1e6);
+    const b = Math.round(lng * 1e6);
+    out += enc(a - pLat) + enc(b - pLng);
+    pLat = a;
+    pLng = b;
+  }
+  return out;
+}
+
+/**
+ * Pistas para cada maniobra (las "flechas en el suelo" de OpenStreetMap, turn:lanes).
+ * Valhalla las entrega en formato OSRM: se recorre la misma ruta (map-matching exacto, edge_walk)
+ * tramo por tramo y cada intersección con pistas se asigna a la maniobra que está justo ahí.
+ * Modifica `route.maneuvers` y devuelve cuántas maniobras quedaron con pistas.
+ */
+export async function fetchLanes(route: Route, signal?: AbortSignal): Promise<number> {
+  const starts = [0, ...route.legEnds.slice(0, -1)];
+  const found: { along: number; lanes: Lane[] }[] = [];
+  await Promise.all(
+    route.legEnds.map(async (end, li) => {
+      const coords = route.coords.slice(starts[li], end + 1);
+      if (coords.length < 2) return;
+      // POST sin cabeceras extra: "petición simple", sin preflight CORS
+      const res = await fetch(TRACE, {
+        method: 'POST',
+        body: JSON.stringify({ encoded_polyline: encodePolyline6(coords), shape_match: 'edge_walk', costing: 'auto', format: 'osrm', language: 'es-ES', units: 'kilometers' }),
+        signal,
+      });
+      const j = await res.json().catch(() => null);
+      const match = (j?.matchings ?? j?.routes)?.[0];
+      if (!match) return;
+      for (const leg of match.legs ?? [])
+        for (const step of leg.steps ?? [])
+          for (const it of step.intersections ?? []) {
+            if (!it.lanes?.length || !Array.isArray(it.location)) continue;
+            const snap = snapToRoute(it.location as LngLat, route.coords, route.cum);
+            if (snap.dist > 15) continue;
+            found.push({
+              along: snap.along,
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              lanes: it.lanes.map((l: any) => ({ ind: l.indications ?? [], ok: !!l.valid, best: !!l.active, use: l.valid_indication })),
+            });
+          }
+    }),
+  );
+  let n = 0;
+  for (const m of route.maneuvers) {
+    // la intersección con pistas más cercana justo antes (o en) la maniobra
+    let best: { along: number; lanes: Lane[] } | undefined;
+    for (const f of found) {
+      if (f.along < m.alongM - 250 || f.along > m.alongM + 15) continue;
+      if (!best || Math.abs(f.along - m.alongM) < Math.abs(best.along - m.alongM)) best = f;
+    }
+    if (best && best.lanes.length > 1 && best.lanes.some((l) => !l.ok)) {
+      m.lanes = best.lanes;
+      n++;
+    }
+  }
+  return n;
+}
+
+/** "Usa la pista de la derecha" / "las 2 pistas de la izquierda" / "las pistas del centro" */
+export function laneHint(lanes?: Lane[]): string | null {
+  if (!lanes || lanes.length < 2) return null;
+  const pick = lanes.some((l) => l.best) ? lanes.map((l) => l.best) : lanes.map((l) => l.ok);
+  const idx = pick.map((v, i) => (v ? i : -1)).filter((i) => i >= 0);
+  if (!idx.length || idx.length === lanes.length) return null;
+  const k = idx.length;
+  const contiguous = idx[k - 1] - idx[0] === k - 1;
+  if (contiguous && idx[k - 1] === lanes.length - 1) return k === 1 ? 'la pista de la derecha' : `las ${k} pistas de la derecha`;
+  if (contiguous && idx[0] === 0) return k === 1 ? 'la pista de la izquierda' : `las ${k} pistas de la izquierda`;
+  return k === 1 ? 'la pista del centro' : 'las pistas del centro';
 }
 
 /** Icono de flecha según el tipo de maniobra de Valhalla */
