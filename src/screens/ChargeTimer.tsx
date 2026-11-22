@@ -9,7 +9,7 @@ import { useTimer, sessionState, type ChargeSession } from '../store/timer';
 import { useUi } from '../store/ui';
 import { ensureNotifications, unlockSpeech, speak } from '../lib/voice';
 import { addCalendarReminder } from '../lib/calendar';
-import { useChargers, nearby, summarize, shortName } from '../lib/chargers';
+import { useChargers, nearby, summarize, shortName, priceStats } from '../lib/chargers';
 import { getCurrentPosition } from '../lib/places';
 import { getWeather } from '../lib/weather';
 
@@ -75,7 +75,8 @@ function SetupCharge() {
   const preset = PRESETS.find((p) => p.id === presetId)!;
   const kw = presetId === 'custom' ? customKw : preset.kw;
   const type = presetId === 'custom' ? customType : preset.type;
-  const effPrice = price ?? (presetId === 'wallbox' || presetId === 'portatil' ? s.priceHome : type === 'DC' ? s.priceDc : s.priceAc);
+  const livePrices = useMemo(() => priceStats(stations), [stations]);
+  const effPrice = price ?? (presetId === 'wallbox' || presetId === 'portatil' ? s.priceHome : type === 'DC' ? livePrices.dc ?? s.priceDc : livePrices.ac ?? s.priceAc);
   const minutes = chargeMinutes(from, to, kw, type, tempC, s.usableKwh);
   const kwh = billedKwh(from, to, type, s.usableKwh);
   const peak = Math.round(chargePowerAt(Math.max(from, 25), kw, type, tempC));

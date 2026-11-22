@@ -22,17 +22,22 @@ import {
   Route as RouteIcon,
   Fuel,
   Wind,
+  Ticket,
+  Radio,
 } from 'lucide-react';
 import PlaceInput from '../components/PlaceInput';
+import MapPicker from '../components/MapPicker';
 import TripMap from '../components/TripMap';
 import SocChart from '../components/SocChart';
 import { RangeField, Segmented, Stepper, Toggle, socColor } from '../components/ui';
 import { CARGO_KG, CARGO_LABEL, MODE_INFO, useSettings, type Cargo, type TripMode } from '../store/settings';
 import { useTrip } from '../store/trip';
 import { useUi } from '../store/ui';
-import { useChargers, summarize, STATE_LABEL, shortName, availabilitySpeech } from '../lib/chargers';
+import { useChargers, summarize, shortName, expectedWaitMin, priceStats, type Station } from '../lib/chargers';
+import { billedKwh } from '../lib/car';
 import { planTrip, googleMapsUrl, type TripPlan } from '../lib/planner';
 import { getCurrentPosition, reverseGeocode, type Place } from '../lib/places';
+import { loadTolls, groupHits } from '../lib/tolls';
 import { getWeather } from '../lib/weather';
 import { fmtCLP, fmtDuration, fmtKm, fmtTime } from '../lib/format';
 
@@ -60,10 +65,13 @@ export default function PlanTrip() {
   const [cargo, setCargo] = useState<Cargo>(s.cargo);
   const [climateOn, setClimateOn] = useState(s.climateOn);
   const [avoidTolls, setAvoidTolls] = useState(s.avoidTolls);
+  /** hora de salida: undefined = ahora */
+  const [departAt, setDepartAt] = useState<number | undefined>(undefined);
   const [temps, setTemps] = useState<{ o?: number; d?: number }>({});
   const [busy, setBusy] = useState(false);
   const [locating, setLocating] = useState(false);
   const [error, setError] = useState<string>();
+  const [picker, setPicker] = useState<'origin' | 'dest' | null>(null);
 
   // Usa la ubicación si el permiso ya fue concedido antes
   useEffect(() => {
@@ -112,6 +120,7 @@ export default function PlanTrip() {
         await refreshChargers();
         list = useChargers.getState().stations;
       } else refreshChargers();
+      const tollData = await loadTolls();
       const tO = temps.o ?? 18;
       const tD = temps.d ?? tO;
       const p = await planTrip(
@@ -130,11 +139,15 @@ export default function PlanTrip() {
           usableKwh: s.usableKwh,
           tempOrigin: tO,
           tempDest: tD,
-          priceDc: s.priceDc,
+          priceDc: priceStats(list).dc ?? s.priceDc,
           gasPrice: s.gasPrice,
           gasKmPerL: s.gasKmPerL,
+          departAt: departAt ?? Date.now(),
         },
         list,
+        undefined,
+        tollData?.tolls ?? [],
+        tollData?.od ?? [],
       );
       setPlan(p);
       addRecent(dest);
@@ -176,9 +189,10 @@ export default function PlanTrip() {
             icon={locating ? <Loader2 size={18} className="spin" /> : <CircleDot size={18} />}
             allowMe
             onPickMe={pickMe}
+            onPickMap={() => setPicker('origin')}
             near={origin?.lngLat}
           />
-          <PlaceInput value={dest} onChange={setDest} placeholder="¿Hacia dónde?" icon={<Flag size={18} />} near={origin?.lngLat} />
+          <PlaceInput value={dest} onChange={setDest} placeholder="¿Hacia dónde?" icon={<Flag size={18} />} near={origin?.lngLat} onPickMap={() => setPicker('dest')} />
         </div>
         <button
           className="icon-btn"
@@ -268,6 +282,27 @@ export default function PlanTrip() {
         <div className="mt8" />
         <Toggle on={climateOn} onChange={setClimateOn} label={<span className="row" style={{ gap: 6 }}><Snowflake size={16} /> Aire acondicionado / calefacción</span>} sub="Se calcula según la temperatura del camino" />
         <Toggle on={avoidTolls} onChange={setAvoidTolls} label="Evitar peajes" sub="Puede alargar el viaje" />
+        <div className="label mt12">
+          <Clock size={13} /> ¿Cuándo sales? (cambia las tarifas punta y del TAG)
+        </div>
+        <Segmented
+          value={departAt === undefined ? 'now' : 'later'}
+          onChange={(v) => setDepartAt(v === 'now' ? undefined : nextHalfHour())}
+          options={[
+            { value: 'now', label: 'Ahora' },
+            { value: 'later', label: 'Elegir hora' },
+          ]}
+        />
+        {departAt !== undefined && (
+          <div className="field mt8">
+            <Clock size={18} color="var(--primary)" />
+            <input
+              type="datetime-local"
+              value={toLocalInput(departAt)}
+              onChange={(e) => e.target.value && setDepartAt(new Date(e.target.value).getTime())}
+            />
+          </div>
+        )}
       </div>
 
       {error && (
@@ -289,6 +324,19 @@ export default function PlanTrip() {
         )}
       </button>
       <div className="tiny muted center mt8">{loadTxt}</div>
+
+      {picker && (
+        <MapPicker
+          title={picker === 'origin' ? '¿Desde dónde sales?' : '¿A dónde vas?'}
+          initial={(picker === 'origin' ? origin : dest)?.lngLat ?? origin?.lngLat ?? dest?.lngLat}
+          onClose={() => setPicker(null)}
+          onPick={(p) => {
+            if (picker === 'origin') setOrigin(p);
+            else setDest(p);
+            setPicker(null);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -299,10 +347,15 @@ function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => v
   const { showStation, showToast } = useUi();
   const stations = useChargers((c) => c.stations);
   const t = plan.totals;
-  const arriveAt = Date.now() + t.totalMin * 60000;
-  const saved = t.gasCostClp - t.costClp;
-  // estado en vivo actualizado de cada parada
+  const departAt = plan.input.departAt && plan.input.departAt > Date.now() + 5 * 60000 ? plan.input.departAt : undefined;
+  const arriveAt = (departAt ?? Date.now()) + t.totalMin * 60000;
+  const tollClp = t.tollClp ?? 0;
+  const tollGroups = groupHits(plan.tolls ?? []);
+  // estado y precio en vivo de cada parada
   const live = useMemo(() => new Map(stations.map((s) => [s.id, s])), [stations]);
+  const fallbackPrice = useMemo(() => priceStats(stations).dc ?? plan.input.priceDc, [stations, plan]);
+  const liveCost = plan.stops.reduce((a, s) => a + stopCost(s, live.get(s.station.id) ?? s.station, fallbackPrice, plan.input.usableKwh).cost, 0);
+  const saved = t.gasCostClp - liveCost;
 
   const share = async () => {
     const lines = [
@@ -310,9 +363,10 @@ function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => v
       `${fmtKm(t.distanceM)} · ${fmtDuration(t.totalMin)} · llegada aprox. ${fmtTime(arriveAt)}`,
       ...plan.stops.map((s, i) => `${i + 1}. ${s.station.name}: ${Math.round(s.arriveSoc)}% → ${s.departSoc}% (${fmtDuration(s.chargeMin)})`),
       `Llegada con ${Math.round(t.arriveSoc)}% de batería`,
+      plan.tolls ? `Carga ≈ ${fmtCLP(liveCost)} · Peajes y TAG ≈ ${fmtCLP(tollClp)}` : '',
       googleMapsUrl(plan),
     ];
-    const text = lines.join('\n');
+    const text = lines.filter(Boolean).join('\n');
     try {
       if (navigator.share) await navigator.share({ title: 'Mi viaje', text });
       else {
@@ -351,7 +405,7 @@ function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => v
             </div>
             <div style={{ fontSize: 34, fontWeight: 800, letterSpacing: '-0.03em', lineHeight: 1.1 }}>{fmtDuration(t.totalMin)}</div>
             <div className="small" style={{ opacity: 0.9, fontWeight: 600 }}>
-              Si sales ahora, llegas ≈ {fmtTime(arriveAt)}
+              {departAt ? `Sales ${fmtDay(departAt)} ${fmtTime(departAt)} · llegas ≈ ${fmtTime(arriveAt)}` : `Si sales ahora, llegas ≈ ${fmtTime(arriveAt)}`}
             </div>
           </div>
           <div style={{ textAlign: 'right' }}>
@@ -368,9 +422,29 @@ function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => v
         <Stat icon={<BatteryCharging size={13} />} k="Cargando" v={fmtDuration(t.chargeMin)} />
         <Stat icon={<Flag size={13} />} k="Llegas con" v={`${Math.round(t.arriveSoc)}%`} color={socColor(t.arriveSoc)} />
         <Stat icon={<Zap size={13} />} k="Energía" v={`${Math.round(t.energyKwh)}`} unit="kWh" />
-        <Stat icon={<Gauge size={13} />} k="Consumo" v={(100 / t.kwhPer100).toLocaleString('es-CL', { maximumFractionDigits: 1, minimumFractionDigits: 1 })} unit="km/kWh" />
-        <Stat icon={<PiggyBank size={13} />} k="Costo carga" v={fmtCLP(t.costClp)} />
+        <Stat icon={<Ticket size={13} />} k="Peajes y TAG" v={plan.tolls ? fmtCLP(tollClp) : '—'} />
+        <Stat icon={<PiggyBank size={13} />} k="Costo carga" v={fmtCLP(liveCost)} />
       </div>
+
+      {plan.tolls && (
+        <div className="card mt12">
+          <div className="row between">
+            <div>
+              <div className="small muted bold">Costo total del viaje</div>
+              <div style={{ fontSize: 28, fontWeight: 800, letterSpacing: '-0.02em' }}>{fmtCLP(liveCost + tollClp)}</div>
+            </div>
+            <div className="small ink2" style={{ textAlign: 'right' }}>
+              <div>
+                Carga <b>{fmtCLP(liveCost)}</b>
+              </div>
+              <div>
+                Peajes y TAG <b>{fmtCLP(tollClp)}</b>
+              </div>
+            </div>
+          </div>
+          <div className="tiny muted mt8">En auto a bencina serían ≈ {fmtCLP(t.gasCostClp + tollClp)} (mismos peajes).</div>
+        </div>
+      )}
 
       {saved > 0 && (
         <div className="card soft mt12 row" style={{ background: 'var(--ok-soft)' }}>
@@ -399,15 +473,60 @@ function TripResult({ plan, onEdit, onStart }: { plan: TripPlan; onEdit: () => v
         <div className="card-title">
           <MapPinned size={16} /> Itinerario
         </div>
-        <Timeline plan={plan} live={live} onStation={(st) => showStation(st)} />
+        <Timeline plan={plan} live={live} fallbackPrice={fallbackPrice} onStation={(st) => showStation(st)} />
+        <div className="tiny muted mt12">
+          Disponibilidad y precios en vivo desde la SEC (se actualizan cada pocos minutos). Para paradas lejanas, el estado de ahora cambia antes de que llegues: por eso se muestra la espera estimada a tu hora de llegada y un plan B. * Precio no informado por el operador: uso el precio promedio en vivo.
+        </div>
       </div>
+
+      {plan.tolls && (
+        <div className="card">
+          <div className="card-title">
+            <Ticket size={16} /> Peajes y TAG
+          </div>
+          {tollGroups.length === 0 && <div className="small muted">Esta ruta no pasa por peajes ni pórticos TAG.</div>}
+          {tollGroups.map((g) => (
+            <div key={g.key} className="list-item">
+              <span className="ic-bubble" style={{ width: 38, height: 38, background: g.kind === 'portico' ? 'var(--primary-soft)' : 'var(--surface-2)' }}>
+                {g.kind === 'portico' ? <Radio size={17} /> : <Ticket size={17} />}
+              </span>
+              <div className="grow">
+                <div className="bold ellipsis">{g.kind === 'portico' ? `${g.title} (TAG)` : `Peaje ${g.title}`}</div>
+                <div className="tiny muted">
+                  {g.kind === 'portico' ? `${g.count} ${g.count === 1 ? 'pórtico' : 'pórticos'}` : g.kind === 'troncal' ? `Troncal · ${g.hits[0].toll.road ?? g.hits[0].toll.concession}` : `Lateral · ${g.hits[0].toll.road ?? g.hits[0].toll.concession}`}
+                  {' · pasas ≈ '}
+                  {fmtTime(g.hits[0].at)}
+                </div>
+              </div>
+              <div style={{ textAlign: 'right', flex: 'none' }}>
+                <div className="bold">{fmtCLP(g.total)}</div>
+                {g.band !== 'normal' && <span className="badge warn">{g.band}</span>}
+                {g.band === 'normal' && g.hits.some((h) => h.toll.seasonal && h.toll.pricePeak) && (
+                  <div className="tiny muted">temporada alta: hasta {fmtCLP(g.hits.reduce((a, h) => a + (h.toll.seasonal && h.toll.pricePeak ? h.toll.pricePeak : h.price), 0))}</div>
+                )}
+              </div>
+            </div>
+          ))}
+          <div className="row between mt8">
+            <span className="bold">Total</span>
+            <span className="bold" style={{ fontSize: 17 }}>
+              {fmtCLP(tollClp)}
+            </span>
+          </div>
+          <div className="tiny muted mt8">
+            Tarifas oficiales 2026 del MOP para autos y camionetas, según la hora en que pasarías por cada punto (horario normal, punta o saturación). Sin TAG, en autopistas urbanas debes comprar el Pase Diario.
+          </div>
+        </div>
+      )}
 
       <div className="card">
         <div className="card-title">
           <BatteryCharging size={16} /> Batería durante el viaje
         </div>
         <SocChart plan={plan} />
-        <div className="tiny muted mt8">Toca o arrastra sobre el gráfico para ver cada kilómetro. Los números son las paradas de carga.</div>
+        <div className="tiny muted mt8">
+          Consumo promedio estimado: <b>{(100 / t.kwhPer100).toLocaleString('es-CL', { maximumFractionDigits: 1, minimumFractionDigits: 1 })} km/kWh</b>. Toca o arrastra sobre el gráfico para ver cada kilómetro. Los números son las paradas de carga.
+        </div>
       </div>
 
       <div className="stack mt16">
@@ -440,7 +559,47 @@ function Stat({ icon, k, v, unit, color }: { icon: React.ReactNode; k: string; v
   );
 }
 
-function Timeline({ plan, live, onStation }: { plan: TripPlan; live: Map<number, TripPlan['stops'][number]['station']>; onStation: (s: TripPlan['stops'][number]['station']) => void }) {
+/** Costo de una parada con el precio en vivo de ese cargador */
+function stopCost(s: TripPlan['stops'][number], st: Station, fallback: number, cap: number) {
+  const informed = summarize(st).priceDc;
+  const price = informed ?? fallback;
+  const kwh = s.kwh ?? billedKwh(Math.max(0, s.arriveSoc), s.departSoc, 'DC', cap);
+  return { cost: kwh * price, price, informed: !!informed };
+}
+
+/** Qué esperar al llegar, considerando la hora de llegada (no solo el estado de ahora) */
+function arrivalAdvice(st: Station, etaMin: number): { tone: 'ok' | 'warn' | 'bad' | 'off'; badge: string; text: string } {
+  const sum = summarize(st);
+  const wait = expectedWaitMin(st, etaMin);
+  const dcTotal = sum.dcFree + sum.dcBusy + sum.dcOffline;
+  const when = fmtDuration(etaMin);
+  if (!isFinite(wait)) return { tone: 'bad', badge: 'Fuera de servicio', text: 'El operador lo informa fuera de servicio: usa el plan B.' };
+  if (sum.dcFree > 0)
+    return { tone: 'ok', badge: `${sum.dcFree}/${dcTotal} libres`, text: etaMin < 40 ? 'Hay cargadores libres ahora.' : `Libre ahora; llegas en ${when}.` };
+  if (sum.dcBusy > 0) {
+    const since = sum.busyLongestMin !== undefined ? ` hace ${Math.round(sum.busyLongestMin)} min` : '';
+    if (etaMin < 40)
+      return { tone: 'warn', badge: `Ocupado${since}`, text: `Se liberaría en ~${Math.round(sum.nextFreeMin ?? 15)} min. Espera estimada al llegar: ~${Math.max(1, Math.round(wait))} min.` };
+    return {
+      tone: 'warn',
+      badge: `Ocupado ahora`,
+      text: `Llegas en ${when}: lo más probable es que ya se haya liberado (espera estimada ~${Math.max(1, Math.round(wait))} min). Una carga rápida dura ~40 min.`,
+    };
+  }
+  return { tone: 'off', badge: 'Sin estado en vivo', text: 'El operador no está informando su estado ahora; ten a mano el plan B.' };
+}
+
+function Timeline({
+  plan,
+  live,
+  fallbackPrice,
+  onStation,
+}: {
+  plan: TripPlan;
+  live: Map<number, Station>;
+  fallbackPrice: number;
+  onStation: (s: Station) => void;
+}) {
   const items: React.ReactNode[] = [];
   const dot = (bg: string, child: React.ReactNode) => (
     <div style={{ width: 34, height: 34, borderRadius: 12, background: bg, color: '#fff', display: 'grid', placeItems: 'center', flex: 'none', boxShadow: '0 4px 10px rgba(20,99,255,.2)' }}>{child}</div>
@@ -472,7 +631,9 @@ function Timeline({ plan, live, onStation }: { plan: TripPlan; live: Map<number,
   plan.stops.forEach((s, i) => {
     items.push(leg(s.alongM, `l${i}`));
     const st = live.get(s.station.id) ?? s.station;
-    const sum = summarize(st);
+    const advice = arrivalAdvice(st, s.etaMin);
+    const cost = stopCost(s, st, fallbackPrice, plan.input.usableKwh);
+    const alts = (s.alternates ?? []).map((a) => ({ ...a, station: live.get(a.station.id) ?? a.station })).slice(0, 2);
     items.push(
       <div key={`s${i}`} className="row" style={{ alignItems: 'flex-start' }}>
         {dot('var(--primary)', <span style={{ fontWeight: 800 }}>{i + 1}</span>)}
@@ -484,9 +645,9 @@ function Timeline({ plan, live, onStation }: { plan: TripPlan; live: Map<number,
             {st.operator} · {st.commune} · {Math.round(s.kw)} kW
           </div>
           <div className="row mt8" style={{ gap: 6, flexWrap: 'wrap' }}>
-            <span className={`badge ${sum.state === 'free' ? 'ok' : sum.state === 'busy' ? 'warn' : sum.state === 'down' ? 'bad' : 'off'}`}>
+            <span className={`badge ${advice.tone}`}>
               <span className="dot" />
-              {sum.state === 'free' ? `${sum.free}/${sum.total} libres` : STATE_LABEL[sum.state]}
+              {advice.badge}
             </span>
             <span className="badge blue">
               <BatteryCharging size={12} /> {Math.round(s.arriveSoc)}% → {s.departSoc}%
@@ -494,9 +655,37 @@ function Timeline({ plan, live, onStation }: { plan: TripPlan; live: Map<number,
             <span className="badge blue">
               <Clock size={12} /> {fmtDuration(s.chargeMin)}
             </span>
-            <span className="badge off">{fmtCLP(s.costClp)}</span>
+            <span className="badge off">
+              {fmtCLP(cost.cost)} · {fmtCLP(cost.price)}/kWh{cost.informed ? '' : '*'}
+            </span>
           </div>
-          <div className="tiny muted mt8">{availabilitySpeech(st)} Llegas en ≈ {fmtDuration(s.etaMin)}.</div>
+          <div className="tiny ink2 mt8">{advice.text}</div>
+          {alts.length > 0 && (
+            <div className="mt8" style={{ background: 'var(--surface-2)', borderRadius: 14, padding: '8px 10px' }}>
+              <div className="tiny bold muted">PLAN B</div>
+              {alts.map((a) => {
+                const asum = summarize(a.station);
+                const dcT = asum.dcFree + asum.dcBusy + asum.dcOffline;
+                const km = Math.abs(a.alongM) / 1000;
+                return (
+                  <button key={a.station.id} className="row" style={{ width: '100%', textAlign: 'left', padding: '5px 0', gap: 8 }} onClick={() => onStation(a.station)}>
+                    <Zap size={14} color="var(--primary)" style={{ flex: 'none' }} />
+                    <span className="grow" style={{ minWidth: 0 }}>
+                      <span className="small bold ellipsis" style={{ display: 'block' }}>
+                        {shortName(a.station)}
+                      </span>
+                      <span className="tiny muted">
+                        {km < 1 ? 'al lado' : `${Math.round(km)} km ${a.alongM < 0 ? 'antes' : 'después'}`} · {Math.min(120, asum.maxDcKw)} kW · {a.station.operator}
+                      </span>
+                    </span>
+                    <span className={`badge ${asum.dcFree > 0 ? 'ok' : asum.dcBusy > 0 ? 'warn' : 'off'}`} style={{ flex: 'none' }}>
+                      {asum.dcFree > 0 ? `${asum.dcFree}/${dcT} libres` : asum.dcBusy > 0 ? 'ocupado' : 'sin dato'}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
       </div>,
     );
@@ -515,4 +704,25 @@ function Timeline({ plan, live, onStation }: { plan: TripPlan; live: Map<number,
     </div>,
   );
   return <div>{items}</div>;
+}
+
+function nextHalfHour() {
+  const d = new Date(Date.now() + 30 * 60000);
+  d.setMinutes(d.getMinutes() < 30 ? 30 : 60, 0, 0);
+  return d.getTime();
+}
+
+function toLocalInput(ms: number) {
+  const d = new Date(ms);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function fmtDay(ms: number) {
+  const d = new Date(ms);
+  const today = new Date();
+  const tomorrow = new Date(Date.now() + 86400000);
+  if (d.toDateString() === today.toDateString()) return 'hoy';
+  if (d.toDateString() === tomorrow.toDateString()) return 'mañana';
+  return d.toLocaleDateString('es-CL', { weekday: 'short', day: 'numeric', month: 'short' });
 }

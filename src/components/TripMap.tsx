@@ -3,6 +3,7 @@ import type { Map as MlMap, Marker } from 'maplibre-gl';
 import MapView, { drawChargerDots, drawRoute, fitTo, htmlMarker, maplibregl } from './MapView';
 import type { TripPlan } from '../lib/planner';
 import { summarize, STATE_COLOR } from '../lib/chargers';
+import { fmtCLP } from '../lib/format';
 
 const BOLT = `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 3 14h8l-1 8 10-12h-8z"/></svg>`;
 
@@ -33,6 +34,14 @@ export default function TripMap({ plan, height = 300, onStopClick }: { plan: Tri
     );
     dest.style.background = '#0B1B3A';
     markers.current.push(new maplibregl.Marker({ element: dest, anchor: 'bottom-left', offset: [-4, 4] }).setLngLat(d).addTo(map));
+
+    // plazas de peaje (los pórticos TAG urbanos se omiten: son demasiados)
+    for (const h of plan.tolls ?? []) {
+      if (h.toll.kind === 'portico') continue;
+      const el = htmlMarker('$', 'toll-pin');
+      el.title = `Peaje ${h.toll.name}: ${fmtCLP(h.price)}`;
+      markers.current.push(new maplibregl.Marker({ element: el }).setLngLat([h.toll.lng, h.toll.lat]).addTo(map));
+    }
 
     plan.stops.forEach((s, i) => {
       const el = htmlMarker(`${BOLT}<span>${i + 1}</span>`, 'stop-pin');

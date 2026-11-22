@@ -1,6 +1,6 @@
 import { Clock, MapPin, Navigation, Plug, Timer, Zap, ParkingSquare } from 'lucide-react';
 import { Sheet } from './ui';
-import { hoursText, isOpenNow, isOra5Compatible, statusBadge, STATUS_LABEL, summarize, shortName, type Station } from '../lib/chargers';
+import { busyText, hoursText, isOpenNow, isOra5Compatible, statusBadge, STATUS_LABEL, summarize, shortName, type Station } from '../lib/chargers';
 import { fmtCLP } from '../lib/format';
 import { wazeUrl } from '../lib/planner';
 import { useUi } from '../store/ui';
@@ -12,7 +12,14 @@ export default function StationSheet({ station, onClose, distanceM }: { station?
   if (!station) return <Sheet open={false} onClose={onClose}>{null}</Sheet>;
   const sum = summarize(station);
   const open = isOpenNow(station);
-  const connectors = station.evses.flatMap((e) => e.connectors.map((c, i) => ({ ...c, evse: e.id, key: `${e.id}-${i}` })));
+  const connectors = station.evses.flatMap((e) => e.connectors.map((c, i) => ({ ...c, evse: e.id, since: e.since, key: `${e.id}-${i}` })));
+  const ago = (iso?: string) => {
+    if (!iso) return null;
+    const m = (Date.now() - Date.parse(iso)) / 60000;
+    if (!isFinite(m) || m < 0) return null;
+    return m < 60 ? `hace ${Math.round(m)} min` : m < 1440 ? `hace ${Math.round(m / 60)} h` : `hace ${Math.round(m / 1440)} días`;
+  };
+  const busy = busyText(station);
   const compatible = connectors.filter(isOra5Compatible);
   const others = connectors.filter((c) => !isOra5Compatible(c));
   const gmaps = `https://www.google.com/maps/dir/?api=1&destination=${station.lat},${station.lng}&travelmode=driving`;
@@ -62,6 +69,11 @@ export default function StationSheet({ station, onClose, distanceM }: { station?
         )}
       </div>
 
+      {busy && (
+        <div className="small mt12" style={{ background: 'var(--warn-soft)', color: '#7a4b00', borderRadius: 14, padding: '8px 12px', fontWeight: 600 }}>
+          Todos los rápidos están ocupados: {busy}.
+        </div>
+      )}
       <div className="label mt16">Conectores para tu Ora 5</div>
       {compatible.length === 0 && <div className="small muted">Este lugar no tiene conectores CCS 2 ni Tipo 2.</div>}
       {compatible.map((c) => (
@@ -78,10 +90,13 @@ export default function StationSheet({ station, onClose, distanceM }: { station?
               {c.type === 'AC' && !c.cable && ' · lleva tu cable'}
             </div>
           </div>
-          <span className={`badge ${statusBadge(c.status)}`}>
-            <span className="dot" />
-            {STATUS_LABEL[c.status]}
-          </span>
+          <div style={{ textAlign: 'right', flex: 'none' }}>
+            <span className={`badge ${statusBadge(c.status)}`}>
+              <span className="dot" />
+              {STATUS_LABEL[c.status]}
+            </span>
+            {c.status === 'OCUPADO' && ago(c.since) && <div className="tiny muted mt8">{ago(c.since)}</div>}
+          </div>
         </div>
       ))}
       {others.length > 0 && <div className="tiny muted mt8">Además: {[...new Set(others.map((c) => c.std))].join(', ')} (no compatibles)</div>}

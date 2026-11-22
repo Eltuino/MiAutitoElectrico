@@ -1,4 +1,10 @@
 import { useEffect, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
+
+/** Capa sobre toda la app (no dentro de la pantalla con scroll) */
+export function Overlay({ children }: { children: ReactNode }) {
+  return createPortal(children, document.querySelector('.app') ?? document.body);
+}
 import { Minus, Plus } from 'lucide-react';
 
 export function Segmented<T extends string | number>({
@@ -92,13 +98,13 @@ export function Sheet({ open, onClose, children }: { open: boolean; onClose: () 
   }, [open, onClose]);
   if (!open) return null;
   return (
-    <>
+    <Overlay>
       <div className="sheet-backdrop" onClick={onClose} />
       <div className="sheet" role="dialog">
         <div className="sheet-grip" />
         {children}
       </div>
-    </>
+    </Overlay>
   );
 }
 

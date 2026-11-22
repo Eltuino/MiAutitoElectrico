@@ -31,7 +31,10 @@ import { RangeField, Sheet, socColor } from '../components/ui';
 import { useTrip } from '../store/trip';
 import { useSettings } from '../store/settings';
 import { useUi } from '../store/ui';
-import { useChargers, summarize, STATE_COLOR, shortName } from '../lib/chargers';
+import { useChargers, summarize, STATE_COLOR, shortName, expectedWaitMin, type Station } from '../lib/chargers';
+import { chargeMinutes } from '../lib/car';
+import type { PlannedStop } from '../lib/planner';
+import { loadTolls, tollPriceAt, tollsOnRoute, type OdSystem, type TollHit, type TollPoint } from '../lib/tolls';
 import { bearing, pointAt, snapToRoute, haversine, type LngLat } from '../lib/geo';
 import { getRoute, maneuverIcon, ARRIVE_TYPES } from '../lib/routing';
 import { chargersAlong, googleMapsUrl } from '../lib/planner';
@@ -94,6 +97,7 @@ export default function Navigate() {
   const [fixVal, setFixVal] = useState(50);
   const [gmapsOpen, setGmapsOpen] = useState(false);
   const [night] = useState(() => isNight());
+  const [swap, setSwap] = useState<{ stopIdx: number; alt: Station; altSoc: number; reason: string; detail: string } | null>(null);
 
   const mapRef = useRef<MlMap | null>(null);
   const puck = useRef<Marker | null>(null);
@@ -102,6 +106,14 @@ export default function Navigate() {
   const watchId = useRef<number | null>(null);
   const simTimer = useRef<number | null>(null);
   const lastChargerSpeech = useRef(0);
+  const tollList = useRef<TollPoint[]>([]);
+  const odList = useRef<OdSystem[]>([]);
+  const tollHits = useRef<TollHit[]>([]);
+  const computeTolls = () => {
+    const n = nav.current;
+    if (!n || !tollList.current.length) return;
+    tollHits.current = tollsOnRoute(n.route, tollList.current, (a) => Date.now() + (n.route.cumT[idxAt(n.route.cum, a)] ?? 0) * 1000, odList.current).hits;
+  };
   const s = useRef<NavState>({
     started: false,
     source: 'gps',
@@ -271,7 +283,7 @@ export default function Navigate() {
             if (dist <= t && dist > t - 700) {
               st.fired.add(key);
               if (!spoke) {
-                const num = stop ? plan.stops.findIndex((p) => p.station.id === rc.station.id) + 1 : undefined;
+                const num = stop ? plan.stops.findIndex((p) => p.station.id === rc.station.id) + 1 || n.stops.indexOf(stop) + 1 + st.arrived.size : undefined;
                 chime('soft');
                 lastChargerSpeech.current = now;
                 speak(chargerAlertText(rc.station, t, num || undefined, stop ? estimateSocAt(n, stop.navAlong) + st.socOffset : undefined));
@@ -298,6 +310,35 @@ export default function Navigate() {
           notify('⚡ Parada de carga', `${shortName(stop.station)}: carga hasta ${stop.departSoc}% (≈ ${min} min)`, 'stop');
         }
       });
+
+      // 4a) plazas de peaje a 1 km (los pórticos TAG no se anuncian: son demasiados)
+      if (voice.voiceOn) {
+        for (const h of tollHits.current) {
+          if (h.toll.kind === 'portico') continue;
+          const d = h.alongM - along;
+          const key = `t-${h.toll.name}-${Math.round(h.alongM / 1000)}`;
+          if (d > 0 && d <= 1000 && !st.fired.has(key)) {
+            st.fired.add(key);
+            if (d > 250) {
+              const { price } = tollPriceAt(h.toll, new Date(now + (d / Math.max(5, speedKmh / 3.6)) * 1000));
+              speak(`Peaje ${h.toll.name} en ${speakDistance(Math.round(d / 100) * 100)}: ${price} pesos.`);
+            }
+          }
+        }
+      }
+
+      // 4b) revisar en vivo la próxima parada (a ~25 km y de nuevo a ~6 km)
+      const nextIdx = n.stops.findIndex((x) => !st.arrived.has(x.station.id) && x.navAlong > along);
+      if (nextIdx >= 0) {
+        const stop = n.stops[nextIdx];
+        const dist = stop.navAlong - along;
+        const key = dist <= 6000 ? `chk2-${stop.station.id}` : dist <= 25000 ? `chk1-${stop.station.id}` : null;
+        if (key && !st.fired.has(key)) {
+          st.fired.add(key);
+          if (key.startsWith('chk2')) st.fired.add(`chk1-${stop.station.id}`);
+          checkStop(nextIdx, along, idx);
+        }
+      }
 
       // 5) batería baja sin parada cerca
       if (socNow < 10 && !st.fired.has('low-10')) {
@@ -337,15 +378,15 @@ export default function Navigate() {
     [plan],
   );
 
-  async function reroute(pos: LngLat) {
+  async function reroute(pos: LngLat, override?: PlannedStop[], message = 'Recalculando ruta.') {
     const st = s.current;
     const n = nav.current;
     if (!plan || !n) return;
     st.rerouting = true;
     render();
-    speak('Recalculando ruta.');
+    speak(message);
     try {
-      const remaining = n.stops.filter((x) => !st.arrived.has(x.station.id) && x.navAlong > st.along);
+      const remaining = override ?? n.stops.filter((x) => !st.arrived.has(x.station.id) && x.navAlong > st.along);
       const pts: LngLat[] = [pos, ...remaining.map((x) => [x.station.lng, x.station.lat] as LngLat), plan.input.destination.lngLat];
       const route = await getRoute(pts, { topSpeed: plan.input.cruiseKmh, avoidTolls: plan.input.avoidTolls });
       const socNow = socAt(n, st.idx, st.along) + st.socOffset;
@@ -354,6 +395,7 @@ export default function Navigate() {
       st.along = 0;
       st.idx = 0;
       st.offSince = 0;
+      computeTolls();
       for (const k of [...st.fired]) if (k.startsWith('m-')) st.fired.delete(k);
       drawAll();
     } catch {
@@ -362,6 +404,105 @@ export default function Navigate() {
       st.rerouting = false;
       render();
     }
+  }
+
+  /** Revisa el estado en vivo de una parada próxima y, si conviene, propone el plan B */
+  function checkStop(stopIdx: number, along: number, idx: number) {
+    const n = nav.current;
+    const st = s.current;
+    if (!n || !plan) return;
+    const r = n.route;
+    const stop = n.stops[stopIdx];
+    const all = useChargers.getState().stations;
+    const byId = new Map(all.map((x) => [x.id, x]));
+    const liveStop = byId.get(stop.station.id) ?? stop.station;
+    const etaStop = Math.max(0, (r.cumT[idxAt(r.cum, stop.navAlong)] - r.cumT[idx]) / 60);
+    const waitStop = expectedWaitMin(liveStop, etaStop);
+    if (waitStop < 8) return; // todo bien (o se libera pronto)
+
+    const sum = summarize(liveStop);
+    const reason = !isFinite(waitStop)
+      ? 'está fuera de servicio'
+      : sum.dcBusy > 0
+        ? sum.busyLongestMin !== undefined && sum.busyLongestMin < 2
+          ? 'se acaba de ocupar'
+          : `está ocupada${sum.busyLongestMin !== undefined ? ` desde hace ${Math.round(sum.busyLongestMin)} minutos` : ''}`
+        : 'no está informando su estado';
+    const num = plan.stops.findIndex((p) => p.station.id === stop.station.id) + 1 || stopIdx + 1 + st.arrived.size;
+
+    // candidatos: plan B guardado + cargadores rápidos en la ruta cerca de la parada
+    const cands = (stop.alternates ?? []).map((a) => ({ station: byId.get(a.station.id) ?? a.station, delta: a.alongM }));
+    for (const rc of n.chargers) {
+      const d = rc.alongM - stop.navAlong;
+      if (Math.abs(d) <= 30000 && rc.station.id !== stop.station.id && isFastCharger(rc.station) && !cands.some((c) => c.station.id === rc.station.id))
+        cands.push({ station: byId.get(rc.station.id) ?? rc.station, delta: d });
+    }
+    const cap = plan.input.usableKwh;
+    const arriveStop = estimateSocAt(n, stop.navAlong) + st.socOffset;
+    let best: { station: Station; delta: number; w: number; soc: number; score: number } | null = null;
+    for (const c of cands) {
+      const altAlong = stop.navAlong + c.delta;
+      if (altAlong < along + 1500) continue; // ya lo pasamos
+      // antes de la parada vale el perfil de batería (sin la carga de la parada); después, se descuenta lo extra
+      const soc = c.delta <= 0 ? estimateSocAt(n, altAlong) + st.socOffset : arriveStop - ((c.delta / 1000) * 0.19 / cap) * 100;
+      if (soc < 6) continue;
+      const eta = Math.max(0, (r.cumT[idxAt(r.cum, Math.min(altAlong, r.distanceM))] - r.cumT[idx]) / 60);
+      const w = expectedWaitMin(c.station, eta);
+      if (!isFinite(w)) continue;
+      const score = w + (Math.abs(c.delta) / 1000) * 0.5;
+      if (!best || score < best.score) best = { ...c, w, soc, score };
+    }
+
+    if (best && best.w < waitStop - 5) {
+      const asum = summarize(best.station);
+      const km = Math.round(Math.abs(best.delta) / 1000);
+      const where = km < 1 ? 'muy cerca' : `${km} kilómetros ${best.delta < 0 ? 'antes' : 'después'}`;
+      const free = asum.dcFree > 0 ? `con ${asum.dcFree} ${asum.dcFree === 1 ? 'cargador libre' : 'cargadores libres'}` : 'con buena probabilidad de estar libre';
+      chime('alert');
+      vibrate([200, 100, 200]);
+      speak(`Atención: tu parada ${num}, ${spokenName(liveStop)}, ${reason}. Una alternativa es ${spokenName(best.station)}, ${where}, ${free}. Toca cambiar parada si quieres ir ahí.`, { priority: true });
+      setSwap({
+        stopIdx,
+        alt: best.station,
+        altSoc: best.soc,
+        reason: `Tu parada ${num} ${reason}.`,
+        detail: `${shortName(best.station)} · ${km < 1 ? 'muy cerca' : `${km} km ${best.delta < 0 ? 'antes' : 'después'}`} · ${Math.min(120, asum.maxDcKw)} kW · ${asum.dcFree > 0 ? `${asum.dcFree} libres` : 'sin datos recientes'}`,
+      });
+    } else if (sum.dcBusy > 0 && sum.nextFreeMin !== undefined) {
+      speak(`Tu parada ${num}, ${spokenName(liveStop)}, ${reason}. Debería liberarse en unos ${Math.round(Math.max(3, sum.nextFreeMin - etaStop))} minutos.`);
+    } else {
+      speak(`Ojo: tu parada ${num}, ${spokenName(liveStop)}, ${reason}. Revisa el plan B en la app.`);
+    }
+  }
+
+  /** Cambia una parada por la alternativa propuesta y recalcula la ruta */
+  function applySwap() {
+    const st = s.current;
+    const n = nav.current;
+    if (!swap || !n || !plan || !st.pos) return;
+    const old = n.stops[swap.stopIdx];
+    const sum = summarize(swap.alt);
+    const kw = Math.min(sum.maxDcKw || 50, 120);
+    const delta = (old.alternates ?? []).find((a) => a.station.id === swap.alt.id)?.alongM ?? 0;
+    // si la alternativa queda antes, el siguiente tramo es más largo: cargar un poco más
+    const extra = delta < 0 ? Math.ceil(((Math.abs(delta) / 1000) * 0.19 / plan.input.usableKwh) * 100) : 0;
+    const departSoc = Math.min(95, old.departSoc + extra);
+    const remaining = n.stops
+      .filter((x) => !st.arrived.has(x.station.id) && x.navAlong > st.along)
+      .map((x) =>
+        x === old
+          ? {
+              ...x,
+              station: swap.alt,
+              kw,
+              departSoc,
+              chargeMin: chargeMinutes(Math.max(0, swap.altSoc), departSoc, kw, 'DC', (plan.input.tempOrigin + plan.input.tempDest) / 2, plan.input.usableKwh),
+              alternates: [{ station: old.station, alongM: -delta, offsetM: 0 }],
+            }
+          : x,
+      );
+    setSwap(null);
+    reroute(st.pos, remaining, `Listo, cambio tu parada a ${spokenName(swap.alt)}.`);
   }
 
   function finish(socNow: number) {
@@ -468,6 +609,29 @@ export default function Navigate() {
     if (source === 'gps') startGps();
     else startSim();
   }
+
+  useEffect(() => {
+    loadTolls().then((d) => {
+      tollList.current = d?.tolls ?? [];
+      odList.current = d?.od ?? [];
+      computeTolls();
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // datos en vivo: cada 4 min cerca de una parada (≤50 km), si no cada 15 min (cada descarga pesa ~3 MB)
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const st = s.current;
+      const n = nav.current;
+      if (!st.started || st.finished || !n || document.visibilityState !== 'visible') return;
+      const next = n.stops.find((x) => !st.arrived.has(x.station.id) && x.navAlong > st.along);
+      const close = !!next && next.navAlong - st.along < 50000;
+      const age = Date.now() - useChargers.getState().updatedAt;
+      if (age > (close ? 4 : 15) * 60000) useChargers.getState().refresh(true);
+    }, 60000);
+    return () => window.clearInterval(id);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -675,6 +839,34 @@ export default function Navigate() {
           )}
         </div>
       </div>
+
+      {/* Propuesta de plan B */}
+      <Sheet open={!!swap} onClose={() => setSwap(null)}>
+        {swap && (
+          <>
+            <div className="row" style={{ alignItems: 'flex-start' }}>
+              <span className="ic-bubble" style={{ background: 'var(--warn-soft)', color: '#C27803' }}>
+                <Zap size={20} />
+              </span>
+              <div className="grow">
+                <h3 style={{ fontSize: 19, fontWeight: 800 }}>¿Cambiar de parada?</h3>
+                <div className="small ink2">{swap.reason}</div>
+              </div>
+            </div>
+            <div className="card soft mt12" style={{ padding: 14 }}>
+              <div className="tiny bold muted">ALTERNATIVA</div>
+              <div className="bold mt8">{swap.detail}</div>
+              <div className="tiny muted mt8">Llegarías con ≈ {Math.max(0, Math.round(swap.altSoc))}% de batería.</div>
+            </div>
+            <button className="btn primary block mt16" onClick={applySwap}>
+              <Zap size={18} /> Cambiar parada
+            </button>
+            <button className="btn ghost block mt8" onClick={() => setSwap(null)}>
+              Mantener mi parada
+            </button>
+          </>
+        )}
+      </Sheet>
 
       {/* Llegada a una parada */}
       <Sheet open={!!arrival} onClose={continueAfterStop}>

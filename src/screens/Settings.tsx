@@ -1,16 +1,17 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Car, Info, Volume2, Wallet, Gauge, Smartphone, Database, Play } from 'lucide-react';
 import { RangeField, Toggle, Segmented } from '../components/ui';
 import { ORA5 } from '../lib/car';
 import { useSettings } from '../store/settings';
 import { speak, unlockSpeech } from '../lib/voice';
 import { fmtCLP } from '../lib/format';
-import { useChargers } from '../lib/chargers';
+import { useChargers, priceStats } from '../lib/chargers';
 import { kwhPerKm } from '../lib/energy';
 
 export default function Settings() {
   const s = useSettings();
   const { stations, source, updatedAt } = useChargers();
+  const live = useMemo(() => priceStats(stations), [stations]);
   const [realKmKwh, setRealKmKwh] = useState(6.5);
   const [kind, setKind] = useState<'mixto' | 'carretera'>('mixto');
 
@@ -96,10 +97,26 @@ export default function Settings() {
         <div className="card-title">
           <Wallet size={16} /> Precios
         </div>
-        <RangeField label="Carga rápida DC (si no está informada)" value={s.priceDc} min={200} max={700} step={10} format={fmtCLP} unit="/kWh" onChange={(v) => s.set({ priceDc: v })} />
-        <div className="mt8" />
-        <RangeField label="Carga AC pública" value={s.priceAc} min={0} max={600} step={10} format={fmtCLP} unit="/kWh" onChange={(v) => s.set({ priceAc: v })} />
-        <div className="mt8" />
+        <div className="grid2">
+          <div className="stat">
+            <div className="k">Carga rápida (DC)</div>
+            <div className="v" style={{ fontSize: 17 }}>
+              {live.dc ? fmtCLP(live.dc) : '—'}
+              <small>/kWh</small>
+            </div>
+          </div>
+          <div className="stat">
+            <div className="k">Carga lenta (AC)</div>
+            <div className="v" style={{ fontSize: 17 }}>
+              {live.ac ? fmtCLP(live.ac) : '—'}
+              <small>/kWh</small>
+            </div>
+          </div>
+        </div>
+        <div className="tiny muted mt8">
+          Automático: cada cargador usa el precio que su operador informa a la SEC, actualizado al abrir la app. Si alguno no informa precio, uso el promedio de arriba.
+        </div>
+        <div className="mt16" />
         <RangeField label="Luz en casa" value={s.priceHome} min={80} max={400} step={5} format={fmtCLP} unit="/kWh" onChange={(v) => s.set({ priceHome: v })} />
         <div className="mt8" />
         <RangeField label="Bencina 93 (para comparar)" value={s.gasPrice} min={900} max={1800} step={10} format={fmtCLP} unit="/L" onChange={(v) => s.set({ gasPrice: v })} />

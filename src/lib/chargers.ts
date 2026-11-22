@@ -24,19 +24,32 @@ export interface StationSummary {
   priceDc?: number;
   priceAc?: number;
   hasDc: boolean;
+  /** conectores rápidos (DC) compatibles por estado */
+  dcFree: number;
+  dcBusy: number;
+  dcOffline: number;
+  /** minutos que lleva ocupado el conector rápido que lleva más tiempo cargando */
+  busyLongestMin?: number;
+  /** estimación de minutos hasta que se libere un conector rápido */
+  nextFreeMin?: number;
   /** estado general para pintar el pin */
   state: 'free' | 'busy' | 'down' | 'offline';
 }
+
+/** Una carga rápida típica dura ~40 min (los datos de la SEC muestran ~41 min de mediana) */
+const TYPICAL_DC_SESSION_MIN = 40;
 
 const summaryCache = new WeakMap<SlimStation, StationSummary>();
 
 export function summarize(s: SlimStation): StationSummary {
   const hit = summaryCache.get(s);
   if (hit) return hit;
-  const sum: StationSummary = { total: 0, free: 0, busy: 0, down: 0, offline: 0, maxDcKw: 0, maxAcKw: 0, hasDc: false, state: 'offline' };
+  const sum: StationSummary = { total: 0, free: 0, busy: 0, down: 0, offline: 0, maxDcKw: 0, maxAcKw: 0, hasDc: false, dcFree: 0, dcBusy: 0, dcOffline: 0, state: 'offline' };
   const dcPrices: number[] = [];
   const acPrices: number[] = [];
+  const now = Date.now();
   for (const e of s.evses) {
+    const sinceMin = e.since ? Math.max(0, (now - Date.parse(e.since)) / 60000) : undefined;
     for (const c of e.connectors) {
       if (!isOra5Compatible(c)) continue;
       sum.total++;
@@ -45,6 +58,11 @@ export function summarize(s: SlimStation): StationSummary {
       else if (c.status === 'NO DISPONIBLE') sum.down++;
       else sum.offline++;
       if (c.type === 'DC') {
+        if (c.status === 'DISPONIBLE') sum.dcFree++;
+        else if (c.status === 'OCUPADO') {
+          sum.dcBusy++;
+          if (sinceMin !== undefined) sum.busyLongestMin = Math.max(sum.busyLongestMin ?? 0, sinceMin);
+        } else if (c.status === 'FUERA DE LINEA') sum.dcOffline++;
         sum.hasDc = true;
         sum.maxDcKw = Math.max(sum.maxDcKw, c.kw);
         if (c.price) dcPrices.push(c.price);
@@ -57,8 +75,56 @@ export function summarize(s: SlimStation): StationSummary {
   if (dcPrices.length) sum.priceDc = Math.min(...dcPrices);
   if (acPrices.length) sum.priceAc = Math.min(...acPrices);
   sum.state = sum.free > 0 ? 'free' : sum.busy > 0 ? 'busy' : sum.offline > 0 ? 'offline' : 'down';
+  if (sum.dcBusy > 0) {
+    const b = sum.busyLongestMin;
+    // si lleva mucho rato (auto que quedó enchufado) no sabemos: asumimos ~10 min
+    sum.nextFreeMin = b === undefined ? 15 : b > TYPICAL_DC_SESSION_MIN + 25 ? 10 : Math.max(3, TYPICAL_DC_SESSION_MIN - b);
+  }
   summaryCache.set(s, sum);
   return sum;
+}
+
+/**
+ * Espera esperada (min) en un cargador rápido si llegas en `etaMin` minutos.
+ * - Si llegas pronto, manda el estado en vivo (y cuánto lleva ocupado).
+ * - Si llegas en horas, el estado de ahora casi no sirve: usamos el riesgo según
+ *   cuántos conectores tiene (más conectores = más probable encontrar uno libre).
+ */
+export function expectedWaitMin(s: SlimStation, etaMin = 0): number {
+  const sum = summarize(s);
+  const usable = sum.dcFree + sum.dcBusy + sum.dcOffline;
+  if (!sum.hasDc || usable === 0) return Infinity;
+  const prior = usable >= 4 ? 1.5 : usable === 3 ? 2.5 : usable === 2 ? 4 : 8;
+  const w = Math.exp(-Math.max(0, etaMin) / 40);
+  let nowWait: number;
+  if (sum.dcFree > 0) nowWait = 0;
+  else if (sum.dcBusy > 0) nowWait = Math.max(0, (sum.nextFreeMin ?? 15) - etaMin);
+  else nowWait = prior + 6; // sin datos en vivo
+  const unknownRisk = sum.dcFree + sum.dcBusy === 0 ? 4 : 0;
+  return w * nowWait + (1 - w) * prior + unknownRisk;
+}
+
+/** Texto corto del estado de un cargador ocupado: "ocupado hace 35 min · se libera en ~5 min" */
+export function busyText(s: SlimStation): string | null {
+  const sum = summarize(s);
+  if (sum.dcFree > 0 || sum.dcBusy === 0) return null;
+  const parts = [];
+  if (sum.busyLongestMin !== undefined) parts.push(`ocupado hace ${Math.round(sum.busyLongestMin)} min`);
+  if (sum.nextFreeMin !== undefined) parts.push(`se liberaría en ~${Math.round(sum.nextFreeMin)} min`);
+  return parts.join(' · ') || null;
+}
+
+/** Precios medianos en vivo (CLP/kWh) de todos los cargadores públicos */
+export function priceStats(stations: SlimStation[]): { dc?: number; ac?: number } {
+  const dc: number[] = [];
+  const ac: number[] = [];
+  for (const s of stations) {
+    const sum = summarize(s);
+    if (sum.priceDc) dc.push(sum.priceDc);
+    if (sum.priceAc) ac.push(sum.priceAc);
+  }
+  const med = (a: number[]) => (a.length ? a.sort((x, y) => x - y)[a.length >> 1] : undefined);
+  return { dc: med(dc), ac: med(ac) };
 }
 
 export const STATE_COLOR: Record<StationSummary['state'], string> = {
@@ -199,6 +265,9 @@ export function nearby(stations: SlimStation[], p: LngLat, radiusM: number, filt
 /** Nombre corto para mostrar: quita el operador repetido al inicio */
 export function shortName(s: SlimStation): string {
   let n = s.name.replace(/^(copec voltex|copec|enel x)\s*[-–:]\s*/i, '');
-  n = n.replace(/^cargador el[eé]ctrico\s*/i, '');
+  n = n.replace(/^cargador el[eé]ctrico\s*/i, '').replace(/[\s.]+$/, '');
   return n || s.name;
 }
+
+// Solo en desarrollo: acceso desde la consola para pruebas
+if (import.meta.env.DEV) (window as unknown as { __chargers: typeof useChargers }).__chargers = useChargers;

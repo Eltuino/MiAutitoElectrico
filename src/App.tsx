@@ -26,16 +26,21 @@ export default function App() {
   const session = useTimer((s) => s.session);
   const charging = session && !sessionState(session).done;
 
+  // Estado en vivo de cargadores: al abrir la app y al volver a ella (si tiene más de 3 min),
+  // y cada 5 min solo mientras miras Cargadores o tu viaje. El modo viaje maneja su propio ritmo.
   useEffect(() => {
     refresh();
-    const id = setInterval(() => document.visibilityState === 'visible' && refresh(), 3 * 60 * 1000);
     const onVis = () => document.visibilityState === 'visible' && refresh();
     document.addEventListener('visibilitychange', onVis);
-    return () => {
-      clearInterval(id);
-      document.removeEventListener('visibilitychange', onVis);
-    };
+    return () => document.removeEventListener('visibilitychange', onVis);
   }, [refresh]);
+
+  useEffect(() => {
+    if (navigating || (tab !== 'chargers' && tab !== 'trip')) return;
+    refresh();
+    const id = setInterval(() => document.visibilityState === 'visible' && refresh(true), 5 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [tab, navigating, refresh]);
 
   return (
     <div className="app">

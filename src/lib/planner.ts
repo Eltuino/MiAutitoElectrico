@@ -1,10 +1,11 @@
 import { billedKwh, chargeMinutes, chargePowerAt, ORA5 } from './car';
-import { summarize, type Station } from './chargers';
+import { expectedWaitMin, summarize, type Station } from './chargers';
 import { routeEnergy, kwhPerKm, type Conditions } from './energy';
 import { snapToRoute, thin, bbox, type LngLat } from './geo';
 import { getRoute, type Route } from './routing';
 import type { Place } from './places';
 import { MODE_INFO, type TripMode } from '../store/settings';
+import { tollsOnRoute, type OdSystem, type TollHit, type TollPoint } from './tolls';
 
 export interface PlanInput {
   origin: Place;
@@ -24,6 +25,8 @@ export interface PlanInput {
   priceDc: number;
   gasPrice: number;
   gasKmPerL: number;
+  /** hora de salida (ms); por defecto ahora */
+  departAt?: number;
 }
 
 export interface PlannedStop {
@@ -37,14 +40,37 @@ export interface PlannedStop {
   /** potencia efectiva del cargador (kW) */
   kw: number;
   costClp: number;
+  /** kWh que se pagan en esta parada (para recalcular el costo con el precio en vivo) */
+  kwh: number;
   /** minutos desde la salida hasta llegar a la parada */
   etaMin: number;
+  /** espera esperada al llegar (min), según estado en vivo y tamaño de la estación */
+  waitMin: number;
+  /** cargadores rápidos alternativos cerca de esta parada (plan B) */
+  alternates: RouteCharger[];
 }
 
 export interface RouteCharger {
   station: Station;
   alongM: number;
   offsetM: number;
+}
+
+/**
+ * Plan B de una parada: otros cargadores rápidos cerca, alcanzables con la batería prevista.
+ * `alongM` aquí es relativo a la parada: negativo = antes, positivo = después.
+ */
+function alternatesFor(stop: Candidate, cands: Candidate[], arriveSoc: number, input: PlanInput): RouteCharger[] {
+  const kwhPerM = kwhPerKm(105, { cruiseKmh: 105, passengers: input.passengers, cargoKg: input.cargoKg, tempC: input.tempOrigin, climateOn: input.climateOn, calibration: input.calibration }) / 1000;
+  return cands
+    .filter((c) => c.station.id !== stop.station.id && c.kw >= 40)
+    .map((c) => ({ c, delta: c.alongM - stop.alongM }))
+    .filter(({ delta }) => delta > -30000 && delta < 30000)
+    // si queda después de la parada, hay que llegar con al menos 5 %
+    .filter(({ delta, c }) => delta <= 0 || arriveSoc - ((delta + c.detourM / 2) * kwhPerM * 1.1 / input.usableKwh) * 100 >= 5)
+    .sort((a, b) => a.c.penaltyMin + Math.abs(a.delta) / 2000 - (b.c.penaltyMin + Math.abs(b.delta) / 2000))
+    .slice(0, 3)
+    .map(({ c, delta }) => ({ station: c.station, alongM: delta, offsetM: c.offsetM }));
 }
 
 export interface TripPlan {
@@ -59,6 +85,8 @@ export interface TripPlan {
   stops: PlannedStop[];
   /** cargadores compatibles a lo largo de la ruta (para avisos) */
   routeChargers: RouteCharger[];
+  /** peajes y pórticos TAG que cruza la ruta */
+  tolls?: TollHit[];
   totals: {
     distanceM: number;
     driveMin: number;
@@ -67,6 +95,8 @@ export interface TripPlan {
     energyKwh: number;
     arriveSoc: number;
     costClp: number;
+    /** peajes + TAG (CLP, autos) */
+    tollClp?: number;
     gasCostClp: number;
     co2SavedKg: number;
     kwhPer100: number;
@@ -124,7 +154,10 @@ function findCandidates(route: Route, stations: Station[], maxOffsetM: number): 
     if (snap.dist > maxOffsetM) continue;
     const idx = thinIdx[Math.min(snap.index + (snap.t > 0.5 ? 1 : 0), thinIdx.length - 1)];
     const detourM = snap.dist * 1.4 * 2;
-    const penaltyMin = sum.free > 0 ? 0 : sum.busy > 0 ? 12 : 6;
+    // espera esperada a la hora en que llegaríamos (el manejo + ~12 % por cargas previas)
+    const etaMin = (route.cumT[idx] / 60) * 1.12;
+    const penaltyMin = expectedWaitMin(s, etaMin);
+    if (!isFinite(penaltyMin)) continue;
     out.push({ station: s, idx, alongM: route.cum[idx], offsetM: snap.dist, detourM, kw: chargerPower(s), penaltyMin });
   }
   return out.sort((a, b) => a.alongM - b.alongM);
@@ -263,7 +296,7 @@ export function chargersAlong(route: Route, stations: Station[], maxOffsetM = 90
   return out.sort((a, b) => a.alongM - b.alongM);
 }
 
-export async function planTrip(input: PlanInput, stations: Station[], signal?: AbortSignal): Promise<TripPlan> {
+export async function planTrip(input: PlanInput, stations: Station[], signal?: AbortSignal, tollList: TollPoint[] = [], odList: OdSystem[] = []): Promise<TripPlan> {
   const cond = conditions(input);
   const tempAt = tempInterp(input);
   const warnings: string[] = [];
@@ -276,6 +309,7 @@ export async function planTrip(input: PlanInput, stations: Station[], signal?: A
   let route = direct;
   let cumKwh = directKwh;
   let stopsRaw: { cand: Candidate; arriveSoc: number; departSoc: number }[] = [];
+  let candList: Candidate[] = [];
   let feasible = true;
 
   if (input.startSoc - needDirect < input.arrivalMin) {
@@ -298,6 +332,7 @@ export async function planTrip(input: PlanInput, stations: Station[], signal?: A
       warnings.push('No encontré una combinación de cargadores públicos para completar este viaje con la batería indicada. Prueba saliendo con más carga o bajando la velocidad.');
     } else {
       stopsRaw = chain;
+      candList = cands;
       // 3) Ruta pasando por las paradas
       if (chain.length) {
         const pts: LngLat[] = [input.origin.lngLat, ...chain.map((c) => [c.cand.station.lng, c.cand.station.lat] as LngLat), input.destination.lngLat];
@@ -342,7 +377,10 @@ export async function planTrip(input: PlanInput, stations: Station[], signal?: A
         chargeMin: chMin,
         kw: raw.cand.kw,
         costClp: billedKwh(Math.max(0, arrive), depart, 'DC', cap) * price,
+        kwh: billedKwh(Math.max(0, arrive), depart, 'DC', cap),
         etaMin: route.cumT[i] / 60 + extraMin,
+        waitMin: expectedWaitMin(raw.cand.station, route.cumT[i] / 60 + extraMin),
+        alternates: alternatesFor(raw.cand, candList, arrive, input),
       });
       extraMin += chMin + STOP_OVERHEAD_MIN;
       base = depart;
@@ -370,6 +408,21 @@ export async function planTrip(input: PlanInput, stations: Station[], signal?: A
   if (tempMax > 30 && input.climateOn) warnings.push('Hace calor: el aire acondicionado sumará consumo.');
   if (input.mode === 'eco' && stops.some((s) => s.departSoc > 80)) warnings.push('Alguna parada necesita cargar sobre 80 %.');
 
+  // Peajes: hora de paso = salida + manejo + cargas hechas antes de ese punto
+  const departAt = input.departAt ?? Date.now();
+  const timeAt = (alongM: number) => {
+    let lo = 0;
+    let hi = route.cum.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (route.cum[mid] <= alongM) lo = mid;
+      else hi = mid;
+    }
+    const chargeBefore = stops.filter((s) => s.alongM < alongM).reduce((a, s) => a + s.chargeMin + STOP_OVERHEAD_MIN, 0);
+    return departAt + route.cumT[lo] * 1000 + chargeBefore * 60000;
+  };
+  const tollHits = tollsOnRoute(route, tollList, timeAt, odList);
+
   return {
     id: Math.random().toString(36).slice(2),
     createdAt: Date.now(),
@@ -379,6 +432,7 @@ export async function planTrip(input: PlanInput, stations: Station[], signal?: A
     soc,
     stops,
     routeChargers: chargersAlong(route, stations),
+    tolls: tollHits.hits,
     totals: {
       distanceM: route.distanceM,
       driveMin,
@@ -390,6 +444,7 @@ export async function planTrip(input: PlanInput, stations: Station[], signal?: A
       gasCostClp: gasL * input.gasPrice,
       co2SavedKg: gasL * 2.31,
       kwhPer100: (energyKwh / (route.distanceM / 1000)) * 100,
+      tollClp: tollHits.total,
     },
     warnings,
     feasible,

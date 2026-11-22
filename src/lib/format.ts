@@ -39,7 +39,7 @@ export function fmtPct(n: number): string {
 /** "a 5 kilómetros" / "a 800 metros" para la voz */
 export function speakDistance(meters: number): string {
   if (meters >= 1000) {
-    const km = Math.round(meters / 100) / 10;
+    const km = meters >= 20000 ? Math.round(meters / 1000) : Math.round(meters / 100) / 10;
     const txt = Number.isInteger(km) ? String(km) : km.toLocaleString('es-CL');
     return km === 1 ? '1 kilómetro' : `${txt} kilómetros`;
   }

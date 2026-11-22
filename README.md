@@ -51,8 +51,11 @@ En Android también se puede usar pantalla dividida.
 | Mapa | OpenFreeMap © OpenStreetMap |
 | Búsqueda de lugares | Photon (Komoot) |
 | Clima y temperatura | Open-Meteo |
+| Peajes y TAG (autos) | Tarifas oficiales 2026 MOP – Dirección General de Concesiones + ubicaciones OpenStreetMap |
 
 `npm run snapshot` actualiza la copia de respaldo de cargadores (`public/data/chargers-snapshot.json`) que se usa sin conexión.
+
+**Peajes:** `public/data/tolls.json` reúne cada plaza de peaje y pórtico TAG con su ubicación (OpenStreetMap) y su tarifa oficial 2026 para autos (normal, punta y saturación cuando corresponde). El MOP publica las tarifas nuevas cada enero en [concesiones.mop.gob.cl/peajes-y-porticos](https://concesiones.mop.gob.cl/peajes-y-porticos/); al actualizarlas, se regenera con `npm run tolls <carpeta>`.
 
 ## Notas del modelo
 

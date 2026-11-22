@@ -21,6 +21,8 @@ export interface SlimConnector {
 export interface SlimEvse {
   id: string;
   status: ConnStatus;
+  /** desde cuándo está en este estado (ISO), según el operador */
+  since?: string;
   connectors: SlimConnector[];
 }
 
@@ -105,7 +107,7 @@ export function slimStations(raw: any[]): SlimStation[] {
           cable: c.format === 'CABLE',
         });
       }
-      if (connectors.length) evses.push({ id: String(e.evse_id ?? e.evse_uid), status: normStatus(e.status), connectors });
+      if (connectors.length) evses.push({ id: String(e.evse_id ?? e.evse_uid), status: normStatus(e.status), since: e.last_updated ?? undefined, connectors });
     }
     if (!evses.length) continue;
 
