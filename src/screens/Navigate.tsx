@@ -38,7 +38,7 @@ import type { PlannedStop } from '../lib/planner';
 import { loadTolls, tollPriceAt, tollsOnRoute, type OdSystem, type TollHit, type TollPoint } from '../lib/tolls';
 import { bearing, pointAt, snapToRoute, haversine, type LngLat } from '../lib/geo';
 import { getRoute, maneuverIcon, fetchLanes, laneHint, ARRIVE_TYPES, type Lane, type Maneuver } from '../lib/routing';
-import { chargersAlong, googleMapsUrl } from '../lib/planner';
+import { chargersAlong, googleMapsUrl, planTrip } from '../lib/planner';
 import { chargerAlertText, farText, isFastCharger, maneuverThresholds, navFromPlan, rebuildNav, spokenName, type NavRoute } from '../lib/nav';
 import { chime, keepScreenOn, speak, unlockSpeech, vibrate, ensureNotifications, notify, stopSpeaking } from '../lib/voice';
 import { downloadRoute, isDownloaded } from '../lib/offlineMap';
@@ -81,6 +81,8 @@ interface NavState {
   /** no evaluar "fuera de ruta" hasta este momento (recién salimos de un túnel / sin internet) */
   graceUntil: number;
   offlineNotified: boolean;
+  /** distancia mínima (en línea recta) a la que has estado de cada parada: para notar si te la pasaste */
+  minDist: Map<number, number>;
 }
 
 /** Hasta dónde estimar la posición sin GPS (los túneles largos de Santiago tienen ~4 km) */
@@ -112,6 +114,8 @@ export default function Navigate() {
   const plan = useTrip((t) => t.plan);
   const addHistory = useTrip((t) => t.addHistory);
   const settings = useSettings();
+  const stationsLive = useChargers((c) => c.stations);
+  const chargersUpdatedAt = useChargers((c) => c.updatedAt);
   const { setNavigating, openTimer, showToast } = useUi();
   const [, render] = useReducer((x: number) => x + 1, 0);
   const [arrivalStop, setArrivalStop] = useState<{ i: number; soc: number } | null>(null);
@@ -162,6 +166,7 @@ export default function Navigate() {
     drLast: 0,
     graceUntil: 0,
     offlineNotified: false,
+    minDist: new Map(),
   });
   const arrivalOpen = useRef(false);
   const [online, setOnline] = useState(() => navigator.onLine);
@@ -286,7 +291,7 @@ export default function Navigate() {
         const offLimit = Math.max(70, accuracy * 1.5);
         if (snap.dist > offLimit && accuracy <= 35) {
           if (!st.offSince) st.offSince = now;
-          if (now - st.offSince > 12000 && now > st.graceUntil && !st.rerouting) reroute(pos);
+          if (now - st.offSince > 12000 && now > st.graceUntil && !st.rerouting) reroute(pos, undefined, undefined, !voice.turnByTurn);
         } else if (snap.dist <= offLimit) st.offSince = 0;
       }
       st.pos = pos;
@@ -297,11 +302,13 @@ export default function Navigate() {
       st.heading = hd;
 
       const socNow = socAt(n, idx, along) + st.socOffset;
+      // modo copiloto: Google Maps guía; MiAutito solo habla de cargas, disponibilidad y batería
+      const copilot = !voice.turnByTurn;
 
       // 2) maniobras
       const mi = nextManeuverIndex(n, along);
       const m = mi >= 0 ? r.maneuvers[mi] : null;
-      if (m && voice.voiceOn && voice.voiceTurns && !ARRIVE_TYPES.has(m.type)) {
+      if (m && !copilot && voice.voiceOn && voice.voiceTurns && !ARRIVE_TYPES.has(m.type)) {
         const dist = m.alongM - along;
         const roadKmh = Math.max(speedKmh, r.speed[idx] ?? 40);
         const th = maneuverThresholds(roadKmh);
@@ -328,7 +335,8 @@ export default function Navigate() {
           if (dist < 0 || dist > 5200) continue;
           const stop = stopIds.get(rc.station.id);
           if (!stop) {
-            if (!voice.voiceAllChargers || !isFastCharger(rc.station) || rc.offsetM > 600) continue;
+            // en copiloto solo tus paradas (lo demás es ruido mientras Google Maps habla)
+            if (copilot || !voice.voiceAllChargers || !isFastCharger(rc.station) || rc.offsetM > 600) continue;
             const state = summarize(rc.station).state;
             if (state === 'offline' || state === 'down') continue;
             // en ciudad hay demasiados: solo avisamos los de carretera
@@ -354,12 +362,21 @@ export default function Navigate() {
         }
       }
 
-      // 4) llegada a una parada de carga
+      // 4) llegada a una parada de carga (con GPS, solo si vas despacio: pasar al lado por la autopista no cuenta)
+      const slow = st.source === 'sim' || speedKmh < 25;
+      const skipped: (typeof n.stops)[number][] = [];
       n.stops.forEach((stop, i) => {
         if (st.arrived.has(stop.station.id)) return;
         const d = stop.navAlong - along;
         const near = haversine(pos, [stop.station.lng, stop.station.lat]);
-        if ((d < 60 && d > -400) || near < 90) {
+        // ¿te la pasaste? te acercaste a menos de 2,5 km y ahora te alejas
+        const min = Math.min(st.minDist.get(stop.station.id) ?? Infinity, near);
+        st.minDist.set(stop.station.id, min);
+        if (st.source === 'gps' && !skipped.length && min < 2500 && near > min + 2500) {
+          skipped.push(stop);
+          return;
+        }
+        if (slow && ((d < 60 && d > -400) || near < 90)) {
           st.arrived.add(stop.station.id);
           setArrivalStop({ i, soc: socNow });
           if (st.source === 'sim') stopSim(); // en la vida real el auto se detiene a cargar
@@ -370,9 +387,10 @@ export default function Navigate() {
           notify('⚡ Parada de carga', `${shortName(stop.station)}: carga hasta ${stop.departSoc}% (≈ ${min} min)`, 'stop');
         }
       });
+      if (skipped.length) skipStop(skipped[0], pos, along);
 
-      // 4a) plazas de peaje a 1 km (los pórticos TAG no se anuncian: son demasiados)
-      if (voice.voiceOn) {
+      // 4a) plazas de peaje a 1 km (los pórticos TAG no se anuncian: son demasiados). En copiloto no.
+      if (voice.voiceOn && !copilot) {
         for (const h of tollHits.current) {
           if (h.toll.kind === 'portico') continue;
           const d = h.alongM - along;
@@ -420,8 +438,17 @@ export default function Navigate() {
       if (map) {
         puck.current?.setLngLat(pos).setRotation(hd);
         if (st.following) {
-          const z = speedKmh > 85 ? 14.6 : speedKmh > 50 ? 15.6 : 16.6;
-          map.easeTo({ center: pos, bearing: hd, pitch: 52, zoom: z, duration: st.source === 'sim' ? 260 : 900, easing: (t) => t, padding: { top: 250, bottom: 150, left: 0, right: 0 } });
+          // copiloto: vista general (no hace falta ver cada esquina, eso lo hace Google Maps)
+          const z = copilot ? (speedKmh > 85 ? 12.4 : speedKmh > 50 ? 13.2 : 14) : speedKmh > 85 ? 14.6 : speedKmh > 50 ? 15.6 : 16.6;
+          map.easeTo({
+            center: pos,
+            bearing: hd,
+            pitch: copilot ? 0 : 52,
+            zoom: z,
+            duration: st.source === 'sim' ? 260 : 900,
+            easing: (t) => t,
+            padding: { top: copilot ? 300 : 250, bottom: 150, left: 0, right: 0 },
+          });
         }
       }
 
@@ -438,7 +465,11 @@ export default function Navigate() {
     [plan],
   );
 
-  async function reroute(pos: LngLat, override?: PlannedStop[], message = 'Recalculando ruta.') {
+  /**
+   * Recalcula desde `pos` pasando por las paradas que quedan. `quiet` (modo copiloto): sin decir nada,
+   * solo para que los km, la hora y la batería sigan correctos si Google Maps te llevó por otro lado.
+   */
+  async function reroute(pos: LngLat, override?: PlannedStop[], message = 'Recalculando ruta.', quiet = false) {
     const st = s.current;
     const n = nav.current;
     if (!plan || !n) return;
@@ -446,7 +477,7 @@ export default function Navigate() {
     if (!navigator.onLine) {
       st.offSince = 0;
       st.graceUntil = Date.now() + 60000;
-      if (!st.offlineNotified) {
+      if (!st.offlineNotified && !quiet) {
         st.offlineNotified = true;
         speak('Estás sin internet, así que no puedo recalcular. Sigo con la ruta planificada: vuelve a ella cuando puedas.');
       }
@@ -455,7 +486,7 @@ export default function Navigate() {
     }
     st.rerouting = true;
     render();
-    speak(message);
+    if (!quiet && message) speak(message);
     try {
       const remaining = override ?? n.stops.filter((x) => !st.arrived.has(x.station.id) && x.navAlong > st.along);
       const pts: LngLat[] = [pos, ...remaining.map((x) => [x.station.lng, x.station.lat] as LngLat), plan.input.destination.lngLat];
@@ -474,15 +505,93 @@ export default function Navigate() {
       st.idx = 0;
       st.offSince = 0;
       computeTolls();
-      // pistas de la nueva ruta (en segundo plano)
-      fetchLanes(route).then(render).catch(() => {});
+      // pistas de la nueva ruta (en segundo plano; en copiloto no hacen falta)
+      if (useSettings.getState().turnByTurn) fetchLanes(route).then(render).catch(() => {});
       for (const k of [...st.fired]) if (k.startsWith('m-')) st.fired.delete(k);
       drawAll();
     } catch {
       // sin señal de datos (túnel, zona rural): seguimos con la ruta que teníamos
       st.offSince = 0;
       st.graceUntil = Date.now() + 45000;
-      showToast('Sin conexión: sigo con la ruta planificada');
+      if (!quiet) showToast('Sin conexión: sigo con la ruta planificada');
+    } finally {
+      st.rerouting = false;
+      render();
+    }
+  }
+
+  /** Te pasaste una parada de carga (o decidiste no parar): avisar con cuánta batería llegarías sin esa carga */
+  function skipStop(stop: NonNullable<typeof nav.current>['stops'][number], pos: LngLat, along: number) {
+    const st = s.current;
+    const n = nav.current;
+    if (!n || !plan) return;
+    st.arrived.add(stop.station.id);
+    // el perfil de batería contaba con esa carga
+    const lost = Math.max(0, stop.departSoc - stop.arriveSoc);
+    const passedVertex = along > stop.navAlong;
+    const next = n.stops.find((x) => !st.arrived.has(x.station.id) && x.navAlong > stop.navAlong);
+    const est = (next ? estimateSocAt(n, next.navAlong) : n.soc[n.soc.length - 1]) + st.socOffset - lost;
+    st.socOffset -= passedVertex || !navigator.onLine ? lost : 0;
+    const where = next ? `a tu próxima parada, ${spokenName(next.station)},` : `a ${plan.input.destination.name}`;
+    chime('alert');
+    // no alcanza: volver a planificar las cargas desde aquí con la batería que queda
+    if (est < Math.max(8, plan.input.arrivalMin / 2) && navigator.onLine) {
+      speak(`Pasaste tu parada de carga, ${spokenName(stop.station)}. Sin esa carga no alcanzas bien ${where.replace(/,$/, '')}: recalculo dónde cargar.`, { priority: true });
+      void replanCharges(pos);
+      return;
+    }
+    let text = `Pasaste tu parada de carga, ${spokenName(stop.station)}. Sin esa carga llegarías ${where} con ${Math.max(0, Math.round(est))} por ciento.`;
+    if (est < 8) {
+      const alt = n.chargers.find((c) => c.alongM > along && isFastCharger(c.station) && c.station.id !== stop.station.id);
+      text += alt ? ` No te alcanza bien: el cargador rápido más cercano adelante es ${spokenName(alt.station)}, a ${speakDistance(alt.alongM - along)}.` : ' No te alcanza bien: busca dónde cargar antes.';
+    }
+    speak(text, { priority: true });
+    // rehacer la ruta sin esa parada (en silencio) para que los km y la batería queden bien
+    reroute(pos, undefined, '', true);
+  }
+
+  /**
+   * Vuelve a elegir las paradas de carga desde donde estás, con la batería estimada de ahora
+   * (te pasaste una parada y ya no alcanza). Mismo modo, velocidad, peajes y destino.
+   */
+  async function replanCharges(pos: LngLat) {
+    const st = s.current;
+    const n = nav.current;
+    if (!plan || !n) return;
+    const socNow = Math.max(1, Math.round(socAt(n, st.idx, st.along) + st.socOffset));
+    st.rerouting = true;
+    render();
+    try {
+      const p2 = await planTrip(
+        { ...plan.input, origin: { name: 'Tu ubicación', detail: '', lngLat: pos, isMe: true }, startSoc: socNow, departAt: Date.now(), routeKey: undefined },
+        useChargers.getState().stations,
+        undefined,
+        tollList.current,
+        odList.current,
+      );
+      nav.current = { route: p2.route, soc: p2.soc, stops: p2.stops.map((x) => ({ ...x, navAlong: x.alongM })), chargers: p2.routeChargers };
+      st.socOffset = 0;
+      st.along = 0;
+      st.idx = 0;
+      st.offSince = 0;
+      st.minDist.clear();
+      for (const k of [...st.fired]) if (/^(m-|c-|chk)/.test(k)) st.fired.delete(k);
+      computeTolls();
+      drawAll();
+      const first = p2.stops[0];
+      speak(
+        first
+          ? `Nueva parada de carga: ${spokenName(first.station)}, a ${speakDistance(first.alongM)}. Llegarías con ${Math.max(0, Math.round(first.arriveSoc))} por ciento y cargas hasta ${first.departSoc}.`
+          : `Con la batería que tienes alcanzas a llegar a ${plan.input.destination.name}.`,
+        { priority: true },
+      );
+      // Google Maps sigue con la parada antigua: avisar que hay que actualizarlo
+      if (!useSettings.getState().turnByTurn) {
+        speak('Para que Google Maps te lleve ahí, toca el botón Google Maps en MiAutito.');
+        showToast('Nueva parada: toca "Google Maps" para actualizar el camino');
+      }
+    } catch {
+      reroute(pos, undefined, '', true);
     } finally {
       st.rerouting = false;
       render();
@@ -686,18 +795,25 @@ export default function Navigate() {
     s.current.following = true;
     render();
     const n = nav.current!;
+    const copilot = !useSettings.getState().turnByTurn;
     const resumed = s.current.along > 200;
-    const first = resumed ? null : n.route.maneuvers[0];
-    const stops = n.stops.filter((x) => !s.current.arrived.has(x.station.id)).length;
+    const first = resumed || copilot ? null : n.route.maneuvers[0];
+    const pending = n.stops.filter((x) => !s.current.arrived.has(x.station.id));
     const left = speakDistance(Math.max(0, n.route.distanceM - s.current.along));
+    const nextTxt =
+      copilot && pending[0]
+        ? ` Primera carga: ${spokenName(pending[0].station)}, a ${speakDistance(Math.max(0, pending[0].navAlong - s.current.along))}. Te aviso antes de llegar.`
+        : '';
     speak(
-      `${resumed ? 'Seguimos' : 'Comenzamos'}. ${left} hasta ${plan!.input.destination.name}${stops ? `, con ${stops} ${stops === 1 ? 'parada' : 'paradas'} de carga` : ''}. ${first ? first.pre ?? '' : ''}`,
+      `${resumed ? 'Seguimos' : 'Comenzamos'}. ${left} hasta ${plan!.input.destination.name}${pending.length ? `, con ${pending.length} ${pending.length === 1 ? 'parada' : 'paradas'} de carga` : ', sin paradas de carga'}.${nextTxt} ${first ? first.pre ?? '' : ''}`,
       { priority: true },
     );
-    // pistas y letreros de salida (en segundo plano; si no hay internet se navega igual)
-    if (navigator.onLine && !n.route.maneuvers.some((x) => x.lanes)) fetchLanes(n.route).then(render).catch(() => {});
     if (source === 'gps') startGps();
     else startSim();
+    // en copiloto Google Maps se encarga del camino: nada de pistas, mapas descargados ni calles reversibles
+    if (copilot) return;
+    // pistas y letreros de salida (en segundo plano; si no hay internet se navega igual)
+    if (navigator.onLine && !n.route.maneuvers.some((x) => x.lanes)) fetchLanes(n.route).then(render).catch(() => {});
     // guardar el mapa del camino por si se pierde la señal (lo ya guardado no se vuelve a bajar)
     if (navigator.onLine && !isDownloaded(plan!.id) && n.route.distanceM < 250000) downloadRoute(plan!.id, n.route.coords).catch(() => {});
     void checkTimedNow();
@@ -791,6 +907,35 @@ export default function Navigate() {
     return () => window.clearInterval(id);
   }, []);
 
+  // Cambios de disponibilidad en tu próxima parada: "se ocuparon todos" / "se liberó uno"
+  const lastFree = useRef(new Map<number, number>());
+  useEffect(
+    () =>
+      useChargers.subscribe((state, prev) => {
+        if (state.stations === prev.stations) return;
+        const st = s.current;
+        const n = nav.current;
+        if (!st.started || st.finished || !n || !useSettings.getState().voiceOn) return;
+        const next = n.stops.find((x) => !st.arrived.has(x.station.id) && x.navAlong > st.along - 50);
+        if (!next) return;
+        const live = state.stations.find((x) => x.id === next.station.id);
+        if (!live) return;
+        const sum = summarize(live);
+        const total = sum.dcFree + sum.dcBusy + sum.dcOffline;
+        const before = lastFree.current.get(live.id);
+        lastFree.current.set(live.id, sum.dcFree);
+        if (before === undefined || next.navAlong - st.along > 80000) return;
+        if (before > 0 && sum.dcFree === 0 && sum.dcBusy > 0) {
+          chime('alert');
+          speak(`Ojo: en tu parada de carga, ${spokenName(live)}, se ocuparon todos los cargadores rápidos. Te aviso si se libera alguno.`, { priority: true });
+        } else if (before === 0 && sum.dcFree > 0) {
+          chime('soft');
+          speak(`Buena noticia: se liberó un cargador en tu parada, ${spokenName(live)}. ${sum.dcFree} de ${total} disponibles.`);
+        }
+      }),
+    [],
+  );
+
   useEffect(() => {
     return () => {
       stopGps();
@@ -837,13 +982,39 @@ export default function Navigate() {
   const ncIsStop = nextCharger && n.stops.some((x) => x.station.id === nextCharger.station.id);
   const arrival = arrivalStop !== null ? n.stops[arrivalStop.i] : null;
   const arrivalSoc = arrivalStop ? Math.max(0, Math.round(arrivalStop.soc)) : 0;
+  const copilot = !settings.turnByTurn;
+  // Google Maps con las paradas que faltan, desde donde estés
+  const gmapsHref = googleMapsUrl({ ...plan, stops: pendingStops }, 'here');
 
   return (
     <div style={{ position: 'absolute', inset: 0, zIndex: 90, background: night ? '#1b1f27' : '#eef2f8' }}>
       <MapView center={plan.input.origin.lngLat} zoom={12} onReady={onMapReady} night={night} />
 
+      {/* Modo copiloto: la próxima carga en grande */}
+      {st.started && !st.finished && copilot && (
+        <div style={{ position: 'absolute', top: 'calc(var(--safe-top) + 12px)', left: 12, right: 12, zIndex: 5 }}>
+          <CopilotCard
+            next={nextStop}
+            stopNumber={nextStop ? (plan.stops.findIndex((p) => p.station.id === nextStop.station.id) + 1 || 1) : 0}
+            distM={nextStop ? Math.max(0, nextStop.navAlong - st.along) : remainingM}
+            etaAt={nextStop ? Date.now() + Math.max(0, (r.cumT[idxAt(r.cum, nextStop.navAlong)] ?? 0) - (r.cumT[st.idx] ?? 0)) * 1000 : etaAt}
+            socArrive={nextStop ? socAtNext ?? 0 : socArrive}
+            destination={plan.input.destination.name}
+            stations={stationsLive}
+            updatedAt={chargersUpdatedAt}
+          />
+          {!online && (
+            <div className="row mt8">
+              <span className="badge off" style={{ background: '#fff', boxShadow: 'var(--shadow)' }}>
+                <WifiOff size={12} /> Sin internet · la disponibilidad no se está actualizando
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Banner de maniobra */}
-      {st.started && !st.finished && (
+      {st.started && !st.finished && !copilot && (
         <div style={{ position: 'absolute', top: 'calc(var(--safe-top) + 12px)', left: 12, right: 12, zIndex: 5 }}>
           <div className="card grad row" style={{ padding: '14px 16px', gap: 14, borderRadius: 24 }}>
             <span style={{ width: 56, height: 56, borderRadius: 18, background: 'rgba(255,255,255,.18)', display: 'grid', placeItems: 'center', flex: 'none' }}>
@@ -922,7 +1093,12 @@ export default function Navigate() {
                   <div className="small muted">
                     {fmtKm(plan.totals.distanceM)} · {fmtDuration(plan.totals.totalMin)} · {plan.stops.length} {plan.stops.length === 1 ? 'parada' : 'paradas'}
                   </div>
-                  {plan.routeOptions && plan.routeOptions.length > 0 && (
+                  {copilot && (
+                    <div className="tiny bold" style={{ color: 'var(--primary)' }}>
+                      {plan.totals.tollClp ? `Peajes y TAG ≈ ${fmtCLP(plan.totals.tollClp)}` : 'Sin peajes'}
+                    </div>
+                  )}
+                  {!copilot && plan.routeOptions && plan.routeOptions.length > 0 && (
                     <div className="tiny bold" style={{ color: 'var(--primary)' }}>
                       Ruta {optionTitle(plan.routeOptions.find((o) => o.key === plan.routeKey) ?? plan.routeOptions[0]).toLowerCase()} ·{' '}
                       {plan.totals.tollClp ? `peajes y TAG ${fmtCLP(plan.totals.tollClp)}` : 'sin peajes'}
@@ -930,18 +1106,50 @@ export default function Navigate() {
                   )}
                 </div>
               </div>
-              <button className="btn primary block mt12" style={{ height: 56 }} onClick={() => begin('gps')}>
-                <NavIcon size={20} /> Comenzar con GPS
-              </button>
-              <div className="grid2 mt8">
-                <button className="btn soft" onClick={() => begin('sim')}>
-                  <PlayCircle size={18} /> Simular
-                </button>
-                <button className="btn ghost" onClick={() => setNavigating(false)}>
-                  Volver
-                </button>
-              </div>
-              <div className="tiny muted center mt8">“Simular” recorre la ruta solo, para que veas y escuches los avisos.</div>
+              {copilot ? (
+                <>
+                  {/* abre Google Maps con las paradas y deja a MiAutito vigilando cargas y batería */}
+                  <a
+                    className="btn primary block mt12"
+                    style={{ height: 56, textDecoration: 'none' }}
+                    href={gmapsHref}
+                    target="_blank"
+                    rel="noreferrer"
+                    onClick={() => begin('gps')}
+                  >
+                    <MapPinned size={20} /> Ir con Google Maps
+                  </a>
+                  <div className="grid3 mt8">
+                    <button className="btn soft sm" onClick={() => begin('gps')}>
+                      Sin abrirlo
+                    </button>
+                    <button className="btn soft sm" onClick={() => begin('sim')}>
+                      <PlayCircle size={16} /> Simular
+                    </button>
+                    <button className="btn ghost sm" onClick={() => setNavigating(false)}>
+                      Volver
+                    </button>
+                  </div>
+                  <div className="tiny muted center mt8">
+                    Google Maps te guía (también en la pantalla del auto con CarPlay). <b>Vuelve a MiAutito y déjala abierta en el teléfono</b>: te avisa cuándo cargar, si el cargador sigue libre y tu batería.
+                  </div>
+                </>
+              ) : (
+                <>
+                  <button className="btn primary block mt12" style={{ height: 56 }} onClick={() => begin('gps')}>
+                    <NavIcon size={20} /> Comenzar con GPS
+                  </button>
+                  <div className="grid2 mt8">
+                    <button className="btn soft" onClick={() => begin('sim')}>
+                      <PlayCircle size={18} /> Simular
+                    </button>
+                    <button className="btn ghost" onClick={() => setNavigating(false)}>
+                      Volver
+                    </button>
+                  </div>
+                  <div className="tiny muted center mt8">“Simular” recorre la ruta solo, para que veas y escuches los avisos.</div>
+                </>
+              )}
             </>
           ) : st.finished ? (
             <div className="center">
@@ -980,7 +1188,7 @@ export default function Navigate() {
                     </div>
                   </button>
                   <div className="tiny muted bold">
-                    {nextStop ? `Parada: ${Math.round(socAtNext ?? 0)}%` : `Llegas: ${Math.round(socArrive)}%`}
+                    {nextStop ? `Parada: ${Math.max(0, Math.round(socAtNext ?? 0))}%` : `Llegas: ${Math.max(0, Math.round(socArrive))}%`}
                   </div>
                 </div>
               </div>
@@ -1001,9 +1209,15 @@ export default function Navigate() {
                 >
                   {settings.voiceOn ? <Volume2 size={20} /> : <VolumeX size={20} />}
                 </button>
-                <button className="btn ghost sm grow" style={{ height: 44 }} onClick={() => setGmapsOpen(true)}>
-                  <MapPinned size={17} /> Google Maps
-                </button>
+                {copilot ? (
+                  <a className="btn ghost sm grow" style={{ height: 44, textDecoration: 'none' }} href={gmapsHref} target="_blank" rel="noreferrer">
+                    <MapPinned size={17} /> Google Maps
+                  </a>
+                ) : (
+                  <button className="btn ghost sm grow" style={{ height: 44 }} onClick={() => setGmapsOpen(true)}>
+                    <MapPinned size={17} /> Google Maps
+                  </button>
+                )}
                 {st.source === 'sim' ? (
                   <button className="btn soft sm" style={{ height: 44 }} onClick={() => ((st.simFactor = st.simFactor >= 48 ? 1 : st.simFactor * 2), render())}>
                     <Gauge size={16} /> {st.simFactor}×
@@ -1140,6 +1354,126 @@ export default function Navigate() {
 }
 
 // ---------------------------------------------------------------------------
+
+/** Modo copiloto: lo único que importa mientras Google Maps guía — la próxima carga */
+function CopilotCard({
+  next,
+  stopNumber,
+  distM,
+  etaAt,
+  socArrive,
+  destination,
+  stations,
+  updatedAt,
+}: {
+  next?: NavRoute['stops'][number];
+  stopNumber: number;
+  distM: number;
+  etaAt: number;
+  socArrive: number;
+  destination: string;
+  stations: Station[];
+  updatedAt: number;
+}) {
+  const ageMin = updatedAt ? Math.max(0, Math.round((Date.now() - updatedAt) / 60000)) : null;
+  const updated = ageMin === null ? '' : ageMin < 1 ? 'recién actualizado' : `actualizado hace ${ageMin} min`;
+
+  if (!next) {
+    return (
+      <div className="card" style={{ padding: 16, borderRadius: 24 }}>
+        <div className="row" style={{ gap: 12 }}>
+          <span className="ic-bubble" style={{ background: 'var(--grad)', color: '#fff' }}>
+            <Flag size={20} />
+          </span>
+          <div className="grow" style={{ minWidth: 0 }}>
+            <div className="tiny bold muted">SIN MÁS CARGAS EN ESTE VIAJE</div>
+            <div className="bold ellipsis" style={{ fontSize: 17 }}>
+              {destination}
+            </div>
+          </div>
+        </div>
+        <div className="grid3 mt12">
+          <CoStat k="Faltan" v={fmtKm(distM)} />
+          <CoStat k="Llegas" v={fmtTime(etaAt)} />
+          <CoStat k="Con" v={`${Math.max(0, Math.round(socArrive))}%`} color={socColor(socArrive)} />
+        </div>
+      </div>
+    );
+  }
+
+  const live = stations.find((x) => x.id === next.station.id) ?? next.station;
+  const sum = summarize(live);
+  const total = sum.dcFree + sum.dcBusy + sum.dcOffline;
+  const etaMin = Math.max(0, (etaAt - Date.now()) / 60000);
+  const wait = expectedWaitMin(live, etaMin);
+  const status = !isFinite(wait)
+    ? { tone: 'bad', text: 'Fuera de servicio' }
+    : sum.dcFree > 0
+      ? { tone: 'ok', text: `${sum.dcFree} de ${total} libres` }
+      : sum.dcBusy > 0
+        ? { tone: 'warn', text: etaMin > 40 ? `Ocupado ahora · espera estimada al llegar ~${Math.max(1, Math.round(wait))} min` : `Ocupado · se liberaría en ~${Math.max(1, Math.round(wait))} min` }
+        : { tone: 'off', text: 'Sin estado en vivo' };
+  const alt = next.alternates?.[0];
+  const altLive = alt ? stations.find((x) => x.id === alt.station.id) ?? alt.station : null;
+  const altSum = altLive ? summarize(altLive) : null;
+
+  return (
+    <div className="card" style={{ padding: 16, borderRadius: 24 }}>
+      <div className="row" style={{ gap: 12 }}>
+        <span className="ic-bubble" style={{ background: 'var(--grad)', color: '#fff' }}>
+          <Zap size={20} />
+        </span>
+        <div className="grow" style={{ minWidth: 0 }}>
+          <div className="tiny bold" style={{ color: 'var(--primary)' }}>
+            PRÓXIMA CARGA{stopNumber ? ` · PARADA ${stopNumber}` : ''}
+          </div>
+          <div className="bold ellipsis" style={{ fontSize: 17 }}>
+            {shortName(live)}
+          </div>
+          <div className="tiny muted ellipsis">
+            {live.operator} · {Math.round(next.kw)} kW{sum.priceDc ? ` · ${fmtCLP(sum.priceDc)}/kWh` : ''}
+          </div>
+        </div>
+      </div>
+      <div className="grid3 mt12">
+        <CoStat k="Faltan" v={fmtKm(distM)} />
+        <CoStat k="Llegas" v={fmtTime(etaAt)} />
+        <CoStat k="Con" v={`${Math.max(0, Math.round(socArrive))}%`} color={socColor(socArrive)} />
+      </div>
+      <div className="row mt12" style={{ gap: 6, flexWrap: 'wrap' }}>
+        <span className={`badge ${status.tone}`}>
+          <span className="dot" /> {status.text}
+        </span>
+        <span className="badge blue">
+          <BatteryCharging size={12} /> hasta {next.departSoc}% · ~{Math.round(next.chargeMin)} min
+        </span>
+      </div>
+      {socArrive < 3 && (
+        <div className="tiny bold mt8" style={{ color: 'var(--bad)' }}>
+          Con la batería estimada no alcanzas a llegar: corrige tu % (toca la batería abajo) o carga antes.
+        </div>
+      )}
+      <div className="tiny muted mt8">{updated ? `Disponibilidad ${updated}` : ''}</div>
+      {altLive && altSum && (
+        <div className="tiny ink2 mt8" style={{ background: 'var(--surface-2)', borderRadius: 12, padding: '7px 10px' }}>
+          <b>Plan B:</b> {shortName(altLive)} · {Math.abs(alt!.alongM) < 1000 ? 'al lado' : `${Math.round(Math.abs(alt!.alongM) / 1000)} km ${alt!.alongM < 0 ? 'antes' : 'después'}`} ·{' '}
+          {altSum.dcFree > 0 ? `${altSum.dcFree} libres` : altSum.dcBusy > 0 ? 'ocupado' : 'sin dato'}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CoStat({ k, v, color }: { k: string; v: string; color?: string }) {
+  return (
+    <div className="stat" style={{ padding: '8px 10px' }}>
+      <div className="k">{k}</div>
+      <div className="v" style={{ fontSize: 19, color }}>
+        {v}
+      </div>
+    </div>
+  );
+}
 
 const LANE_ICON: Record<string, typeof ArrowUp> = {
   straight: ArrowUp,

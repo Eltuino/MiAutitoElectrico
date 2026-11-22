@@ -83,9 +83,19 @@ export default function Settings() {
           <Volume2 size={16} /> Voz y avisos
         </div>
         <Toggle on={s.voiceOn} onChange={(v) => s.set({ voiceOn: v })} label="Avisos por voz" sub="Habla durante el viaje y la carga" />
-        <Toggle on={s.voiceTurns} onChange={(v) => s.set({ voiceTurns: v })} label="Indicaciones de giro" sub='"En 300 metros, gire a la derecha…" (apágalo si usas Google Maps)' />
-        <Toggle on={s.voiceChargers} onChange={(v) => s.set({ voiceChargers: v })} label="Avisos de cargadores" sub='"Copec Voltex a 5 kilómetros, 2 de 2 disponibles"' />
-        <Toggle on={s.voiceAllChargers} onChange={(v) => s.set({ voiceAllChargers: v })} label="Avisar todos los cargadores rápidos del camino" sub="No solo tus paradas planificadas" />
+        <Toggle on={s.voiceChargers} onChange={(v) => s.set({ voiceChargers: v })} label="Avisos de tus paradas de carga" sub='"Tu parada de carga, Copec Voltex, a 5 kilómetros. 2 de 2 disponibles"' />
+        <Toggle
+          on={s.turnByTurn}
+          onChange={(v) => s.set({ turnByTurn: v, voiceTurns: v || s.voiceTurns })}
+          label="Navegar con MiAutito (giro a giro)"
+          sub="Apagado = modo copiloto: Google Maps te guía y MiAutito solo avisa de cargas y batería. Encendido: indicaciones de giro, pistas, tipos de ruta, rutas frecuentes y mapas sin conexión."
+        />
+        {s.turnByTurn && (
+          <>
+            <Toggle on={s.voiceTurns} onChange={(v) => s.set({ voiceTurns: v })} label="Indicaciones de giro por voz" sub='"En 300 metros, gire a la derecha…"' />
+            <Toggle on={s.voiceAllChargers} onChange={(v) => s.set({ voiceAllChargers: v })} label="Avisar todos los cargadores rápidos del camino" sub="No solo tus paradas planificadas" />
+          </>
+        )}
         <RangeField label="Velocidad de la voz" value={s.voiceRate} min={0.7} max={1.4} step={0.05} format={(v) => `${v.toFixed(2)}×`} onChange={(v) => s.set({ voiceRate: v })} />
         <button
           className="btn soft block mt12"
@@ -129,8 +139,12 @@ export default function Settings() {
         <RangeField label="Rendimiento auto a bencina equivalente" value={s.gasKmPerL} min={7} max={20} step={0.5} unit="km/L" onChange={(v) => s.set({ gasKmPerL: v })} />
       </div>
 
-      <SavedRoutesCard />
-      <OfflineMapsCard />
+      {s.turnByTurn && (
+        <>
+          <SavedRoutesCard />
+          <OfflineMapsCard />
+        </>
+      )}
 
       <div className="card">
         <div className="card-title">
@@ -141,13 +155,13 @@ export default function Settings() {
             <b>1.</b> Agrega esta app a la pantalla de inicio (Compartir → “Agregar a inicio” en iPhone, o menú ⋮ → “Instalar app” en Android).
           </div>
           <div>
-            <b>2.</b> Para usarla junto a Google Maps: abre la ruta en Google Maps desde la app y luego <b>vuelve a MiAutito</b>. Google Maps te seguirá guiando por voz en segundo plano y MiAutito te avisará de cargadores y batería.
+            <b>2.</b> En el viaje toca <b>“Ir con Google Maps”</b>: se abre con tus paradas de carga. Con CarPlay, Google Maps queda en la pantalla del Ora.
           </div>
           <div>
-            <b>3.</b> En Android también puedes usar <b>pantalla dividida</b>: Google Maps arriba y MiAutito abajo.
+            <b>3.</b> <b>Vuelve a MiAutito y déjala abierta en el teléfono</b> (en un soporte): te avisa por voz cuándo viene tu carga, si se ocupó o se liberó un cargador y cuánta batería te queda. Si te pasas una parada, te dice con cuánto llegarías sin cargar.
           </div>
           <div>
-            <b>4.</b> MiAutito necesita estar en pantalla para avisarte (el teléfono no la deja hablar si está cerrada). La app mantiene la pantalla encendida durante el viaje.
+            <b>4.</b> En iPhone, MiAutito <b>solo funciona en pantalla</b>: si la cierras o bloqueas el teléfono deja de avisar. Durante el viaje mantiene la pantalla encendida.
           </div>
         </div>
       </div>

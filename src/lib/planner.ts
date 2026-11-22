@@ -497,17 +497,20 @@ export async function planTrip(input: PlanInput, stations: Station[], signal?: A
   };
 }
 
-/** Link de Google Maps con las paradas como waypoints */
-export function googleMapsUrl(plan: TripPlan, from?: LngLat): string {
-  const o = from ?? plan.input.origin.lngLat;
+/**
+ * Link de Google Maps con las paradas como waypoints.
+ * `from = 'here'` (o un origen "Mi ubicación") deja que Google Maps parta desde tu GPS.
+ */
+export function googleMapsUrl(plan: TripPlan, from?: LngLat | 'here'): string {
   const d = plan.input.destination.lngLat;
   const wps = plan.stops.map((s) => `${s.station.lat},${s.station.lng}`).join('|');
-  const p = new URLSearchParams({
-    api: '1',
-    origin: `${o[1]},${o[0]}`,
-    destination: `${d[1]},${d[0]}`,
-    travelmode: 'driving',
-  });
+  const p = new URLSearchParams({ api: '1' });
+  const o = from === 'here' ? null : from ?? (plan.input.origin.isMe ? null : plan.input.origin.lngLat);
+  if (o) p.set('origin', `${o[1]},${o[0]}`);
+  p.set('destination', `${d[1]},${d[0]}`);
+  p.set('travelmode', 'driving');
+  // si el viaje evita peajes, Google Maps también (para que vayan por el mismo camino)
+  if (plan.input.routePref === 'sinpeajes' || plan.input.avoidTolls) p.set('avoid', 'tolls');
   if (wps) p.set('waypoints', wps);
   return `https://www.google.com/maps/dir/?${p.toString()}`;
 }

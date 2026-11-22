@@ -37,6 +37,11 @@ export interface Settings {
   routePref: RoutePref;
   /** @deprecated reemplazado por routePref */
   avoidTolls?: boolean;
+  /**
+   * false (por defecto) = modo copiloto: navegas con Google Maps/Waze y MiAutito solo avisa de cargas,
+   * disponibilidad y batería. true = navegación giro a giro en MiAutito (pistas, tipos de ruta, mapas sin conexión…)
+   */
+  turnByTurn: boolean;
   // Voz y avisos
   voiceOn: boolean;
   voiceTurns: boolean;
@@ -66,7 +71,8 @@ export const useSettings = create<Settings>()(
       cargo: 'normal',
       arrivalMin: 15,
       climateOn: true,
-      routePref: 'economica',
+      routePref: 'rapida',
+      turnByTurn: false,
       voiceOn: true,
       voiceTurns: true,
       voiceChargers: true,
@@ -81,11 +87,13 @@ export const useSettings = create<Settings>()(
     }),
     {
       name: 'mae.settings.v1',
-      version: 2,
-      // v1 tenía "Evitar peajes" (sí/no): se convierte en el tipo de ruta
+      version: 3,
+      // v1 tenía "Evitar peajes" (sí/no). v3: modo copiloto con Google Maps, que elige la ruta más rápida
+      // (o sin peajes si se lo pides), así que el cálculo usa lo mismo para que los peajes coincidan
       migrate: (persisted, version) => {
         const p = (persisted ?? {}) as Partial<Settings>;
-        if (version < 2) return { ...p, routePref: p.avoidTolls ? 'sinpeajes' : 'economica' } as Settings;
+        const noTolls = version < 2 ? !!p.avoidTolls : p.routePref === 'sinpeajes';
+        if (version < 3) return { ...p, routePref: noTolls ? 'sinpeajes' : 'rapida', turnByTurn: false } as Settings;
         return p as Settings;
       },
       storage: createJSONStorage(() => {

@@ -115,7 +115,7 @@ export default function Home() {
       </button>
 
       {/* Rutas frecuentes: un toque calcula desde donde estés y abre la navegación */}
-      {saved.length > 0 ? (
+      {!s.turnByTurn ? null : saved.length > 0 ? (
         <div className="mt16">
           <div className="row between" style={{ padding: '0 4px 8px' }}>
             <div className="bold">Tus rutas</div>

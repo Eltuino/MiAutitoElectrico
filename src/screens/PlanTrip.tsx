@@ -57,6 +57,8 @@ const MODE_ICON: Record<TripMode, React.ReactNode> = {
 
 export default function PlanTrip() {
   const s = useSettings();
+  /** navegación completa en MiAutito (si no, modo copiloto con Google Maps) */
+  const full = s.turnByTurn;
   const { plan, setPlan, addRecent } = useTrip();
   const stations = useChargers((c) => c.stations);
   const refreshChargers = useChargers((c) => c.refresh);
@@ -268,7 +270,7 @@ export default function PlanTrip() {
       />
     );
 
-  const loadTxt = `${MODE_INFO[mode].label} · ${speed} km/h · ${passengers} ${passengers === 1 ? 'persona' : 'personas'} · ruta ${ROUTE_PREFS[routePref].short.toLowerCase()}`;
+  const loadTxt = `${MODE_INFO[mode].label} · ${speed} km/h · ${passengers} ${passengers === 1 ? 'persona' : 'personas'} · ${full ? `ruta ${ROUTE_PREFS[routePref].short.toLowerCase()}` : routePref === 'sinpeajes' ? 'sin peajes' : 'con peajes'}`;
 
   return (
     <div className="screen">
@@ -284,7 +286,7 @@ export default function PlanTrip() {
         )}
       </div>
 
-      {saved.length > 0 && (
+      {full && saved.length > 0 && (
         <div className="chips" style={{ marginBottom: 12 }}>
           {saved.map((r) => (
             <button key={r.id} className="chip" style={{ background: '#fff', boxShadow: 'var(--shadow)', padding: '9px 14px', fontSize: 13.5 }} onClick={() => runSaved(r, false)}>
@@ -399,21 +401,33 @@ export default function PlanTrip() {
 
       <div className="card">
         <div className="card-title">
-          <Ticket size={16} /> Ruta, peajes y TAG
+          <Ticket size={16} /> {full ? 'Ruta, peajes y TAG' : 'Peajes y hora de salida'}
         </div>
-        <div className="opt-grid" role="radiogroup">
-          {(Object.keys(ROUTE_PREFS) as RoutePref[]).map((k) => (
-            <button key={k} className={`opt ${routePref === k ? 'on' : ''}`} role="radio" aria-checked={routePref === k} onClick={() => setRoutePref(k)}>
-              <span className="ic-bubble">{ROUTE_ICON[k]}</span>
-              {ROUTE_PREFS[k].short}
-            </button>
-          ))}
-        </div>
-        <div className="small ink2 mt8" style={{ padding: '0 4px' }}>
-          {ROUTE_PREFS[routePref].sub} Siempre verás las otras rutas con su precio para elegir.
-        </div>
+        {full ? (
+          <>
+            <div className="opt-grid" role="radiogroup">
+              {(Object.keys(ROUTE_PREFS) as RoutePref[]).map((k) => (
+                <button key={k} className={`opt ${routePref === k ? 'on' : ''}`} role="radio" aria-checked={routePref === k} onClick={() => setRoutePref(k)}>
+                  <span className="ic-bubble">{ROUTE_ICON[k]}</span>
+                  {ROUTE_PREFS[k].short}
+                </button>
+              ))}
+            </div>
+            <div className="small ink2 mt8" style={{ padding: '0 4px' }}>
+              {ROUTE_PREFS[routePref].sub} Siempre verás las otras rutas con su precio para elegir.
+            </div>
+          </>
+        ) : (
+          // Google Maps elige la ruta: aquí solo lo mismo que él permite, para que los peajes calculados coincidan
+          <Toggle
+            on={routePref === 'sinpeajes'}
+            onChange={(v) => setRoutePref(v ? 'sinpeajes' : 'rapida')}
+            label="Evitar peajes"
+            sub="Actívalo también en Google Maps (Opciones de ruta) para que ambos vayan por el mismo camino"
+          />
+        )}
         <div className="label mt12">
-          <Clock size={13} /> ¿Cuándo sales? (cambia peajes punta, TAG, calles reversibles y vías exclusivas)
+          <Clock size={13} /> ¿Cuándo sales? (cambia las tarifas punta y del TAG)
         </div>
         <Segmented
           value={departAt === undefined ? 'now' : 'later'}
@@ -488,6 +502,7 @@ function TripResult({
 }) {
   const { showStation, showToast } = useUi();
   const [saveOpen, setSaveOpen] = useState(false);
+  const full = useSettings((x) => x.turnByTurn);
   const stations = useChargers((c) => c.stations);
   const t = plan.totals;
   const departAt = plan.input.departAt && plan.input.departAt > Date.now() + 5 * 60000 ? plan.input.departAt : undefined;
@@ -535,9 +550,11 @@ function TripResult({
           </div>
           <h1>Tu viaje</h1>
         </div>
-        <button className="icon-btn" onClick={() => setSaveOpen(true)} aria-label="Guardar ruta">
-          <BookmarkPlus size={18} />
-        </button>
+        {full && (
+          <button className="icon-btn" onClick={() => setSaveOpen(true)} aria-label="Guardar ruta">
+            <BookmarkPlus size={18} />
+          </button>
+        )}
         <button className="icon-btn" onClick={share} aria-label="Compartir">
           <Share2 size={18} />
         </button>
@@ -568,7 +585,7 @@ function TripResult({
         </div>
       </div>
 
-      <RouteChoices plan={plan} busyKey={busyKey} onPick={onPickRoute} />
+      {full && <RouteChoices plan={plan} busyKey={busyKey} onPick={onPickRoute} />}
 
       <div className="grid3 mt12">
         <Stat icon={<Navigation size={13} />} k="Manejo" v={fmtDuration(t.driveMin)} />
@@ -699,19 +716,27 @@ function TripResult({
         </div>
       </div>
 
-      <OfflineCard key={plan.id} plan={plan} />
+      {full && <OfflineCard key={plan.id} plan={plan} />}
 
       <div className="stack mt16">
-        <button className="btn soft block" onClick={() => setSaveOpen(true)}>
-          <BookmarkPlus size={19} /> Guardar como ruta frecuente
-        </button>
+        {full && (
+          <button className="btn soft block" onClick={() => setSaveOpen(true)}>
+            <BookmarkPlus size={19} /> Guardar como ruta frecuente
+          </button>
+        )}
         <button className="btn primary block" style={{ height: 60, fontSize: 16.5 }} onClick={onStart} disabled={!plan.feasible && plan.stops.length === 0 && t.arriveSoc < 0}>
           <Navigation size={20} /> Iniciar viaje
         </button>
-        <a className="btn ghost block" href={googleMapsUrl(plan)} target="_blank" rel="noreferrer" style={{ textDecoration: 'none' }}>
-          <MapPinned size={20} color="#12B76A" />
-          Abrir en Google Maps
-        </a>
+        {full ? (
+          <a className="btn ghost block" href={googleMapsUrl(plan)} target="_blank" rel="noreferrer" style={{ textDecoration: 'none' }}>
+            <MapPinned size={20} color="#12B76A" />
+            Abrir en Google Maps
+          </a>
+        ) : (
+          <div className="tiny muted center" style={{ padding: '0 12px' }}>
+            Al iniciar se abre Google Maps con tus paradas de carga. Vuelve a MiAutito y déjala en pantalla: te avisa cuándo cargar, si el cargador está libre y cuánta batería te queda.
+          </div>
+        )}
       </div>
       <div className="tiny muted center mt12" style={{ padding: '0 12px' }}>
         Estimaciones basadas en la ficha del Ora 5, la ruta, las pendientes y el clima. Puedes ajustar el consumo real en Ajustes.
